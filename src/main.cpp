@@ -55,13 +55,13 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_v1.1";
+const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_Status_T260321";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
 unsigned long lastMotionTime = 0;
 unsigned long lastBroadcastTime = 0;
-const unsigned long BROADCAST_COOLDOWN = 5000UL;
+unsigned long broadcastCooldown = 5000UL;  // Configurable broadcast cooldown
 bool motionDetected = false;
 int currentMotorSpeed = 0;   // Track motor for status
 int currentLedPwm = 0;       // Track LED PWM for status
@@ -112,6 +112,7 @@ void setup() {
   holdTime = prefs.getULong("holdtime", 5000UL);
   dimTime  = prefs.getULong("dimtime",  10000UL);
   dimLevel = prefs.getInt("dimlevel",   50);
+  broadcastCooldown = prefs.getULong("broadcast", 5000UL);
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -187,6 +188,7 @@ void saveLightSettings() {
   prefs.putULong("holdtime", holdTime);
   prefs.putULong("dimtime", dimTime);
   prefs.putInt("dimlevel", dimLevel);
+  prefs.putULong("broadcast", broadcastCooldown);
   prefs.end();
 }
 
@@ -235,7 +237,7 @@ void loop() {
     lastMotionTime = millis();
     analogWrite(LED_PIN, 255);
     currentLedPwm = 255;
-    if (groupName != "" && millis() - lastBroadcastTime >= BROADCAST_COOLDOWN) {
+    if (groupName != "" && millis() - lastBroadcastTime >= broadcastCooldown) {
       MeshSerial.printf("%s:light:on\n", groupName.c_str());
       lastBroadcastTime = millis();
     }
@@ -407,6 +409,14 @@ void loop() {
         MeshSerial.printf("dimlevel → %d\n", dimLevel);
       }
     }
+    else if (cmd.startsWith("broadcast:")) {
+      unsigned long val = cmd.substring(10).toInt();
+      if (val >= 1000 && val <= 30000) {
+        broadcastCooldown = val;
+        saveLightSettings();
+        MeshSerial.printf("broadcast → %lu\n", broadcastCooldown);
+      }
+    }
     // parameter: config dump
     else if (cmd == "parameter") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
@@ -415,16 +425,19 @@ void loop() {
       MeshSerial.printf("holdtime: %lu\n", holdTime);
       MeshSerial.printf("dimtime: %lu\n", dimTime);
       MeshSerial.printf("dimlevel: %d\n", dimLevel);
-      MeshSerial.printf("broadcast: %lu\n", BROADCAST_COOLDOWN);
+      MeshSerial.printf("broadcast: %lu\n", broadcastCooldown);
       MeshSerial.printf("version: %s\n", FIRMWARE_VERSION);
     }
     // status: runtime dump
     else if (cmd == "status") {
+      MeshSerial.printf("name: %s\n", deviceName.c_str());
+      MeshSerial.printf("group: %s\n", groupName.c_str());
+
       String wifiState;
       if (!wifiEnabled) {
         wifiState = "disabled";
       } else if (WiFi.status() == WL_CONNECTED) {
-        wifiState = "connected " + wifi_ssid;
+        wifiState = "connected " + wifi_ssid + " " + WiFi.localIP().toString();
       } else {
         wifiState = "off";
       }
