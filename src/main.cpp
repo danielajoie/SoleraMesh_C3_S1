@@ -29,6 +29,9 @@ void saveLightSettings();
 void setupOTA();
 void setServoAngle(int channel, int angle);
 int16_t readReg(uint8_t reg);
+uint8_t readDS1307(uint8_t reg);
+void writeDS1307(uint8_t reg, uint8_t data);
+void readTime();
 
 // Hardware configuration
 const int SERVO1_PIN = 5;
@@ -47,13 +50,31 @@ const int PIR_PIN = 4;       // PIR motion sensor
 #define SHUNT_RESISTOR 0.1  // Ohms
 #define SDA_PIN 8
 #define SCL_PIN 9
-#define I2C_ADDR 0x40
+#define I2C_ADDR_INA 0x40
+
+// DS1307 configuration
+#define DS1307_ADDR 0x68
 
 // INA3221 runtime variables
 float inaBusV[3] = {0, 0, 0};    // Bus voltage for Ch1,2,3
 float inaShuntV[3] = {0, 0, 0};  // Shunt voltage
 float inaCurrent[3] = {0, 0, 0}; // Current
 float inaPower[3] = {0, 0, 0};   // Power
+
+// DS1307 time structure
+struct TimeStruct {
+  uint8_t second;
+  uint8_t minute;
+  uint8_t hour;
+  uint8_t dayOfWeek;
+  uint8_t dayOfMonth;
+  uint8_t month;
+  uint8_t year;
+};
+
+// DS1307 runtime variables
+TimeStruct currentTime = {0, 0, 0, 0, 0, 0, 0};
+bool ds1307Present = false;
 
 // Updatable variables (via mesh commands)
 String deviceName;           // Customizable device name
@@ -70,7 +91,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_T260322";
+const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_DS1307_T260323";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -170,7 +191,7 @@ void setup() {
     config |= 0x0020;  // Avg 128 (bits 5-3=100)
     config |= 0x0007;  // Mode shunt+bus cont (bits 2-0=111)
 
-    Wire.beginTransmission(I2C_ADDR);
+    Wire.beginTransmission(I2C_ADDR_INA);
     Wire.write(0x00);
     Wire.write(config >> 8);
     Wire.write(config & 0xFF);
@@ -179,6 +200,28 @@ void setup() {
     config = readReg(0x00);
     Serial.print("Updated config: 0x"); Serial.println(config, HEX);
     Serial.println("INA3221 Initialized");
+  }
+
+  // Initialize DS1307
+  // Check if DS1307 is present by reading a register
+  Wire.beginTransmission(DS1307_ADDR);
+  Wire.write(0x00);  // Seconds register
+  if (Wire.endTransmission() == 0) {
+    ds1307Present = true;
+    Serial.println("DS1307 RTC found");
+
+    // Enable oscillator if not already running
+    uint8_t seconds = readDS1307(0x00);
+    if (seconds & 0x80) {  // CH bit set (oscillator stopped)
+      writeDS1307(0x00, seconds & 0x7F);  // Clear CH bit to start oscillator
+      Serial.println("DS1307 oscillator started");
+    }
+
+    // Read initial time
+    readTime();
+    Serial.println("DS1307 Initialized");
+  } else {
+    Serial.println("DS1307 RTC not found");
   }
 }
 
@@ -193,10 +236,10 @@ void setServoAngle(int channel, int angle) {
 
 // INA3221 functions
 int16_t readReg(uint8_t reg) {
-  Wire.beginTransmission(I2C_ADDR);
+  Wire.beginTransmission(I2C_ADDR_INA);
   Wire.write(reg);
   Wire.endTransmission();
-  Wire.requestFrom(I2C_ADDR, 2);
+  Wire.requestFrom(I2C_ADDR_INA, 2);
   if (Wire.available() < 2) return 0;
   return (Wire.read() << 8) | Wire.read();
 }
@@ -222,6 +265,95 @@ void readINA3221() {
     inaCurrent[ch-1] = inaShuntV[ch-1] / SHUNT_RESISTOR;
     inaPower[ch-1] = inaBusV[ch-1] * inaCurrent[ch-1];
   }
+}
+
+// DS1307 functions
+uint8_t decToBcd(uint8_t val) {
+  return ((val / 10 * 16) + (val % 10));
+}
+
+uint8_t bcdToDec(uint8_t val) {
+  return ((val / 16 * 10) + (val % 16));
+}
+
+void writeDS1307(uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(DS1307_ADDR);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+uint8_t readDS1307(uint8_t reg) {
+  Wire.beginTransmission(DS1307_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom(DS1307_ADDR, 1);
+  if (Wire.available()) {
+    return Wire.read();
+  }
+  return 0;
+}
+
+void readTime() {
+  if (!ds1307Present) return;
+
+  currentTime.second = bcdToDec(readDS1307(0x00) & 0x7F);
+  currentTime.minute = bcdToDec(readDS1307(0x01));
+  currentTime.hour = bcdToDec(readDS1307(0x02) & 0x3F);
+  currentTime.dayOfWeek = bcdToDec(readDS1307(0x03));
+  currentTime.dayOfMonth = bcdToDec(readDS1307(0x04));
+  currentTime.month = bcdToDec(readDS1307(0x05));
+  currentTime.year = bcdToDec(readDS1307(0x06));
+}
+
+void setTime(uint8_t second, uint8_t minute, uint8_t hour, uint8_t dayOfWeek, uint8_t dayOfMonth, uint8_t month, uint8_t year) {
+  if (!ds1307Present) return;
+
+  writeDS1307(0x00, decToBcd(second));
+  writeDS1307(0x01, decToBcd(minute));
+  writeDS1307(0x02, decToBcd(hour));
+  writeDS1307(0x03, decToBcd(dayOfWeek));
+  writeDS1307(0x04, decToBcd(dayOfMonth));
+  writeDS1307(0x05, decToBcd(month));
+  writeDS1307(0x06, decToBcd(year));
+
+  // Update current time
+  currentTime.second = second;
+  currentTime.minute = minute;
+  currentTime.hour = hour;
+  currentTime.dayOfWeek = dayOfWeek;
+  currentTime.dayOfMonth = dayOfMonth;
+  currentTime.month = month;
+  currentTime.year = year;
+}
+
+void syncNTP() {
+  if (!wifiEnabled || WiFi.status() != WL_CONNECTED) {
+    MeshSerial.println("wifi OFF");
+    return;
+  }
+
+  configTime(0, 0, "pool.ntp.org");  // UTC time
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 10000)) {  // 10 second timeout
+    setTime(timeinfo.tm_sec, timeinfo.tm_min, timeinfo.tm_hour,
+            timeinfo.tm_wday + 1, timeinfo.tm_mday, timeinfo.tm_mon + 1,
+            timeinfo.tm_year - 100);  // tm_year is years since 1900, DS1307 uses 00-99
+    MeshSerial.println("NTP sync successful");
+  } else {
+    MeshSerial.println("NTP sync failed");
+  }
+}
+
+String getTimeString() {
+  if (!ds1307Present) return "RTC not found";
+
+  char buf[20];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          currentTime.year + 2000, currentTime.month, currentTime.dayOfMonth,
+          currentTime.hour, currentTime.minute, currentTime.second);
+  return String(buf);
 }
 
 void attemptWiFiConnect() {
@@ -308,9 +440,16 @@ void setupOTA() {
 
 void loop() {
   static unsigned long lastINARead = 0;
+  static unsigned long lastTimeRead = 0;
+
   if (millis() - lastINARead >= 5000) {  // Read every 5 seconds
     readINA3221();
     lastINARead = millis();
+  }
+
+  if (millis() - lastTimeRead >= 1000) {  // Read time every second
+    readTime();
+    lastTimeRead = millis();
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -534,6 +673,9 @@ void loop() {
       MeshSerial.printf("servo1: %d\n", currentServo1Angle);
       MeshSerial.printf("servo2: %d\n", currentServo2Angle);
 
+      // Time
+      MeshSerial.printf("time: %s\n", getTimeString().c_str());
+
       // Power monitoring
       MeshSerial.printf("solar: %.2fV %.1fmA %.3fW\n", inaBusV[0], inaCurrent[0]*1000, inaPower[0]);
       MeshSerial.printf("battery: %.2fV %.1fmA %.3fW\n", inaBusV[1], inaCurrent[1]*1000, inaPower[1]);
@@ -546,6 +688,30 @@ void loop() {
         MeshSerial.printf("Ch%d (%s): BusV=%.3fV ShuntV=%.1fmV I=%.1fmA P=%.3fW\n",
                           ch+1, chName.c_str(), inaBusV[ch], inaShuntV[ch]*1000, inaCurrent[ch]*1000, inaPower[ch]);
       }
+    }
+    // time: get current UTC time
+    else if (cmd == "time") {
+      MeshSerial.printf("time: %s\n", getTimeString().c_str());
+    }
+    // time:set:YYYY-MM-DD HH:MM:SS - set UTC time manually
+    else if (cmd.startsWith("time:set:")) {
+      String timeStr = cmd.substring(9);
+      int y, m, d, h, min, s;
+      if (sscanf(timeStr.c_str(), "%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &min, &s) == 6) {
+        if (y >= 2000 && y <= 2099 && m >= 1 && m <= 12 && d >= 1 && d <= 31 &&
+            h >= 0 && h <= 23 && min >= 0 && min <= 59 && s >= 0 && s <= 59) {
+          setTime(s, min, h, 1, d, m, y - 2000);  // Default dayOfWeek=1 (Monday)
+          MeshSerial.printf("time set: %s\n", getTimeString().c_str());
+        } else {
+          MeshSerial.println("Invalid time format");
+        }
+      } else {
+        MeshSerial.println("Invalid time format (use: YYYY-MM-DD HH:MM:SS)");
+      }
+    }
+    // time:sync - NTP sync (only if WiFi enabled)
+    else if (cmd == "time:sync") {
+      syncNTP();
     }
   }
 }
