@@ -7,9 +7,10 @@ Hardware/pins:
 - LED: GPIO 7 (PWM via analogWrite)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
-- PIR: GPIO 3 (digital input)
-- UART: GPIO 4 (RX) / GPIO 9 (TX) for Meshtastic
-Libraries: WiFi, ArduinoOTA, Preferences
+- PIR: GPIO 4 (digital input)
+- UART: GPIO 3 (RX) / GPIO 2 (TX) for Meshtastic
+- I2C: GPIO 8 (SDA) / GPIO 9 (SCL) for INA3221
+Libraries: WiFi, ArduinoOTA, Preferences, Wire
 Date: March 2026
 */
 
@@ -18,6 +19,7 @@ Date: March 2026
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <Wire.h>
 
 // Function prototypes
 void attemptWiFiConnect();
@@ -26,6 +28,7 @@ void saveWiFiCredentials();
 void saveLightSettings();
 void setupOTA();
 void setServoAngle(int channel, int angle);
+int16_t readReg(uint8_t reg);
 
 // Hardware configuration
 const int SERVO1_PIN = 5;
@@ -35,10 +38,22 @@ const int LED_PIN    = 7;
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
 
-const int UART_RX_PIN = 4;   // ESP32-C3 RX ← Meshtastic TX
-const int UART_TX_PIN = 9;   // ESP32-C3 TX → Meshtastic RX
+const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX
+const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX
 
-const int PIR_PIN = 3;       // PIR motion sensor
+const int PIR_PIN = 4;       // PIR motion sensor
+
+// INA3221 configuration
+#define SHUNT_RESISTOR 0.1  // Ohms
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define I2C_ADDR 0x40
+
+// INA3221 runtime variables
+float inaBusV[3] = {0, 0, 0};    // Bus voltage for Ch1,2,3
+float inaShuntV[3] = {0, 0, 0};  // Shunt voltage
+float inaCurrent[3] = {0, 0, 0}; // Current
+float inaPower[3] = {0, 0, 0};   // Power
 
 // Updatable variables (via mesh commands)
 String deviceName;           // Customizable device name
@@ -55,7 +70,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_Status_T260321";
+const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_T260322";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -135,6 +150,36 @@ void setup() {
 
   setServoAngle(0, 90);
   setServoAngle(1, 90);
+
+  // Initialize INA3221
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Verify chip: Manu ID 0xFE=0x5449 (TI)
+  uint16_t manu = readReg(0xFE);
+  if (manu != 0x5449) {
+    Serial.print("INA3221 not found (Manu ID: 0x"); Serial.print(manu, HEX); Serial.println(")");
+  } else {
+    Serial.println("INA3221 found");
+
+    // Config
+    uint16_t config = readReg(0x00);
+    Serial.print("Initial config: 0x"); Serial.println(config, HEX);
+
+    config |= 0x7000;  // Enable Ch1-3 (bits 14-12)
+    config &= ~0x003F; // Clear avg (5-3), mode (2-0)
+    config |= 0x0020;  // Avg 128 (bits 5-3=100)
+    config |= 0x0007;  // Mode shunt+bus cont (bits 2-0=111)
+
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(0x00);
+    Wire.write(config >> 8);
+    Wire.write(config & 0xFF);
+    Wire.endTransmission();
+
+    config = readReg(0x00);
+    Serial.print("Updated config: 0x"); Serial.println(config, HEX);
+    Serial.println("INA3221 Initialized");
+  }
 }
 
 void setServoAngle(int channel, int angle) {
@@ -143,6 +188,39 @@ void setServoAngle(int channel, int angle) {
     servo1.write(angle);
   } else if (channel == 1) {
     servo2.write(angle);
+  }
+}
+
+// INA3221 functions
+int16_t readReg(uint8_t reg) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom(I2C_ADDR, 2);
+  if (Wire.available() < 2) return 0;
+  return (Wire.read() << 8) | Wire.read();
+}
+
+float getBusVoltage(uint8_t ch) {
+  if (ch < 1 || ch > 3) return NAN;
+  int16_t raw = readReg(0x02 + (ch-1)*2) >> 3;
+  return raw * 0.008f;
+}
+
+float getShuntVoltage(uint8_t ch) {
+  if (ch < 1 || ch > 3) return NAN;
+  int16_t raw = readReg(0x01 + (ch-1)*2);
+  raw >>= 3;  // 13-bit
+  if (raw & 0x1000) raw |= 0xF000;  // Sign extend
+  return raw * 0.00004f;
+}
+
+void readINA3221() {
+  for (uint8_t ch = 1; ch <= 3; ch++) {
+    inaBusV[ch-1] = getBusVoltage(ch);
+    inaShuntV[ch-1] = getShuntVoltage(ch);
+    inaCurrent[ch-1] = inaShuntV[ch-1] / SHUNT_RESISTOR;
+    inaPower[ch-1] = inaBusV[ch-1] * inaCurrent[ch-1];
   }
 }
 
@@ -229,6 +307,12 @@ void setupOTA() {
 }
 
 void loop() {
+  static unsigned long lastINARead = 0;
+  if (millis() - lastINARead >= 5000) {  // Read every 5 seconds
+    readINA3221();
+    lastINARead = millis();
+  }
+
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
 
   // PIR + LED logic
@@ -449,6 +533,19 @@ void loop() {
       MeshSerial.printf("motor: %d\n", currentMotorSpeed);
       MeshSerial.printf("servo1: %d\n", currentServo1Angle);
       MeshSerial.printf("servo2: %d\n", currentServo2Angle);
+
+      // Power monitoring
+      MeshSerial.printf("solar: %.2fV %.1fmA %.3fW\n", inaBusV[0], inaCurrent[0]*1000, inaPower[0]);
+      MeshSerial.printf("battery: %.2fV %.1fmA %.3fW\n", inaBusV[1], inaCurrent[1]*1000, inaPower[1]);
+      MeshSerial.printf("led_load: %.2fV %.1fmA %.3fW\n", inaBusV[2], inaCurrent[2]*1000, inaPower[2]);
+    }
+    // ina: detailed power readings
+    else if (cmd == "ina") {
+      for (uint8_t ch = 0; ch < 3; ch++) {
+        String chName = (ch == 0) ? "Solar" : (ch == 1) ? "Battery" : "LED Load";
+        MeshSerial.printf("Ch%d (%s): BusV=%.3fV ShuntV=%.1fmV I=%.1fmA P=%.3fW\n",
+                          ch+1, chName.c_str(), inaBusV[ch], inaShuntV[ch]*1000, inaCurrent[ch]*1000, inaPower[ch]);
+      }
     }
   }
 }
