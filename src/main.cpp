@@ -84,6 +84,8 @@ String wifi_password;        // WiFi password
 unsigned long holdTime = 5000UL;  // ms: full power after no motion
 unsigned long dimTime  = 10000UL; // ms: dim level before off
 int dimLevel           = 50;      // %: dim brightness
+int8_t utcOffset = 0;        // UTC offset in hours (-12 to +12)
+bool observeDST = false;     // Observe daylight saving time
 
 // Defaults
 const char* DEFAULT_SSID     = "YourWiFiSSID";
@@ -91,7 +93,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_DS1307_T260323";
+const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_DS1307_TZ260325";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -149,6 +151,11 @@ void setup() {
   dimTime  = prefs.getULong("dimtime",  10000UL);
   dimLevel = prefs.getInt("dimlevel",   50);
   broadcastCooldown = prefs.getULong("broadcast", 5000UL);
+  prefs.end();
+
+  prefs.begin("timezone", false);
+  utcOffset = prefs.getChar("offset", 0);
+  observeDST = prefs.getBool("dst", false);
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -346,7 +353,80 @@ void syncNTP() {
   }
 }
 
+bool isDST() {
+  if (!observeDST) return false;
+
+  // Simple US DST: March to November (2nd Sunday in March to 1st Sunday in November)
+  int year = currentTime.year + 2000;
+  int month = currentTime.month;
+  int day = currentTime.dayOfMonth;
+
+  if (month < 3 || month > 11) return false;
+  if (month > 3 && month < 11) return true;
+
+  // March: DST starts on 2nd Sunday
+  if (month == 3) {
+    int firstSunday = (1 + (7 - ((2 + year/4 - year/100 + year/400) % 7)) % 7);
+    int secondSunday = firstSunday + 7;
+    return day >= secondSunday;
+  }
+
+  // November: DST ends on 1st Sunday
+  if (month == 11) {
+    int firstSunday = (1 + (7 - ((2 + year/4 - year/100 + year/400) % 7)) % 7);
+    return day < firstSunday;
+  }
+
+  return false;
+}
+
 String getTimeString() {
+  if (!ds1307Present) return "RTC not found";
+
+  int8_t totalOffset = utcOffset;
+  if (isDST()) totalOffset += 1;
+
+  // Apply timezone offset to get local time
+  int localHour = currentTime.hour + totalOffset;
+  int localDay = currentTime.dayOfMonth;
+  int localMonth = currentTime.month;
+  int localYear = currentTime.year + 2000;
+
+  // Handle day/month/year rollover
+  if (localHour >= 24) {
+    localHour -= 24;
+    localDay++;
+    // Simple day increment (not accounting for month lengths)
+    if (localDay > 31) {
+      localDay = 1;
+      localMonth++;
+      if (localMonth > 12) {
+        localMonth = 1;
+        localYear++;
+      }
+    }
+  } else if (localHour < 0) {
+    localHour += 24;
+    localDay--;
+    if (localDay < 1) {
+      localMonth--;
+      if (localMonth < 1) {
+        localMonth = 12;
+        localYear--;
+      }
+      // Simple day decrement (not accounting for month lengths)
+      localDay = 31; // Approximation
+    }
+  }
+
+  char buf[20];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          localYear, localMonth, localDay,
+          localHour, currentTime.minute, currentTime.second);
+  return String(buf);
+}
+
+String getUTCTimeString() {
   if (!ds1307Present) return "RTC not found";
 
   char buf[20];
@@ -399,6 +479,13 @@ void saveLightSettings() {
   prefs.putULong("dimtime", dimTime);
   prefs.putInt("dimlevel", dimLevel);
   prefs.putULong("broadcast", broadcastCooldown);
+  prefs.end();
+}
+
+void saveTimezoneSettings() {
+  prefs.begin("timezone", false);
+  prefs.putChar("offset", utcOffset);
+  prefs.putBool("dst", observeDST);
   prefs.end();
 }
 
@@ -673,8 +760,12 @@ void loop() {
       MeshSerial.printf("servo1: %d\n", currentServo1Angle);
       MeshSerial.printf("servo2: %d\n", currentServo2Angle);
 
-      // Time
-      MeshSerial.printf("time: %s\n", getTimeString().c_str());
+      // Time - show local time, with UTC if different
+      if (utcOffset != 0 || observeDST) {
+        MeshSerial.printf("time: %s (UTC: %s)\n", getTimeString().c_str(), getUTCTimeString().c_str());
+      } else {
+        MeshSerial.printf("time: %s\n", getTimeString().c_str());
+      }
 
       // Power monitoring
       MeshSerial.printf("solar: %.2fV %.1fmA %.3fW\n", inaBusV[0], inaCurrent[0]*1000, inaPower[0]);
@@ -693,14 +784,49 @@ void loop() {
     else if (cmd == "time") {
       MeshSerial.printf("time: %s\n", getTimeString().c_str());
     }
-    // time:set:YYYY-MM-DD HH:MM:SS - set UTC time manually
+    // time:set:YYYY-MM-DD HH:MM:SS - set local time manually (converts to UTC for storage)
     else if (cmd.startsWith("time:set:")) {
       String timeStr = cmd.substring(9);
       int y, m, d, h, min, s;
       if (sscanf(timeStr.c_str(), "%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &min, &s) == 6) {
         if (y >= 2000 && y <= 2099 && m >= 1 && m <= 12 && d >= 1 && d <= 31 &&
             h >= 0 && h <= 23 && min >= 0 && min <= 59 && s >= 0 && s <= 59) {
-          setTime(s, min, h, 1, d, m, y - 2000);  // Default dayOfWeek=1 (Monday)
+          // Convert local time to UTC for storage
+          int8_t totalOffset = utcOffset;
+          if (observeDST && isDST()) totalOffset += 1;
+
+          int utcHour = h - totalOffset;
+          int utcDay = d;
+          int utcMonth = m;
+          int utcYear = y;
+
+          // Handle day/month/year rollover for UTC conversion
+          if (utcHour >= 24) {
+            utcHour -= 24;
+            utcDay++;
+            // Simple day increment
+            if (utcDay > 31) {
+              utcDay = 1;
+              utcMonth++;
+              if (utcMonth > 12) {
+                utcMonth = 1;
+                utcYear++;
+              }
+            }
+          } else if (utcHour < 0) {
+            utcHour += 24;
+            utcDay--;
+            if (utcDay < 1) {
+              utcMonth--;
+              if (utcMonth < 1) {
+                utcMonth = 12;
+                utcYear--;
+              }
+              utcDay = 31; // Approximation
+            }
+          }
+
+          setTime(s, min, utcHour, 1, utcDay, utcMonth, utcYear - 2000);  // Default dayOfWeek=1 (Monday)
           MeshSerial.printf("time set: %s\n", getTimeString().c_str());
         } else {
           MeshSerial.println("Invalid time format");
@@ -712,6 +838,39 @@ void loop() {
     // time:sync - NTP sync (only if WiFi enabled)
     else if (cmd == "time:sync") {
       syncNTP();
+    }
+    // timezone:offset:X - Set UTC offset in hours (-12 to +12)
+    else if (cmd.startsWith("timezone:offset:")) {
+      int offset = cmd.substring(16).toInt();
+      if (offset >= -12 && offset <= 12) {
+        utcOffset = offset;
+        saveTimezoneSettings();
+        MeshSerial.printf("timezone offset → %d\n", utcOffset);
+      } else {
+        MeshSerial.println("Invalid offset (-12 to +12)");
+      }
+    }
+    // timezone:dst:on/off - Enable/disable DST observation
+    else if (cmd.startsWith("timezone:dst:")) {
+      String state = cmd.substring(13);
+      state.toLowerCase();
+      if (state == "on" || state == "1") {
+        observeDST = true;
+        saveTimezoneSettings();
+        MeshSerial.println("DST observation → on");
+      } else if (state == "off" || state == "0") {
+        observeDST = false;
+        saveTimezoneSettings();
+        MeshSerial.println("DST observation → off");
+      } else {
+        MeshSerial.println("Use 'on' or 'off'");
+      }
+    }
+    // timezone - Display current timezone settings
+    else if (cmd == "timezone") {
+      MeshSerial.printf("timezone offset: %d hours\n", utcOffset);
+      MeshSerial.printf("DST observation: %s\n", observeDST ? "on" : "off");
+      MeshSerial.printf("current DST: %s\n", isDST() ? "active" : "inactive");
     }
   }
 }
