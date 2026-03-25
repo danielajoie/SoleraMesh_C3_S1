@@ -738,8 +738,8 @@ void loop() {
       MeshSerial.printf("broadcast: %lu\n", broadcastCooldown);
       MeshSerial.printf("version: %s\n", FIRMWARE_VERSION);
     }
-    // status: runtime dump
-    else if (cmd == "status") {
+    // statusG: general status (name, group, wifi, light, time)
+    else if (cmd == "statusG") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("group: %s\n", groupName.c_str());
 
@@ -756,10 +756,6 @@ void loop() {
       String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
       MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
 
-      MeshSerial.printf("motor: %d\n", currentMotorSpeed);
-      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
-      MeshSerial.printf("servo2: %d\n", currentServo2Angle);
-
       // Time - show local time, with UTC if different
       if (utcOffset != 0 || observeDST) {
         MeshSerial.printf("time: %s (UTC: %s)\n", getTimeString().c_str(), getUTCTimeString().c_str());
@@ -767,10 +763,28 @@ void loop() {
         MeshSerial.printf("time: %s\n", getTimeString().c_str());
       }
 
-      // Power monitoring
+      // Timezone info
+      char tzSign = (utcOffset >= 0) ? '+' : '-';
+      int tzAbs = abs(utcOffset);
+      MeshSerial.printf("timezone: UTC%c%d, DST=%s (%s)\n", tzSign, tzAbs,
+                       observeDST ? "on" : "off", isDST() ? "active" : "inactive");
+    }
+    // statusP: power status (name, solar, battery, led_load)
+    else if (cmd == "statusP") {
+      MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("solar: %.2fV %.1fmA %.3fW\n", inaBusV[0], inaCurrent[0]*1000, inaPower[0]);
       MeshSerial.printf("battery: %.2fV %.1fmA %.3fW\n", inaBusV[1], inaCurrent[1]*1000, inaPower[1]);
       MeshSerial.printf("led_load: %.2fV %.1fmA %.3fW\n", inaBusV[2], inaCurrent[2]*1000, inaPower[2]);
+    }
+    // statusM: motor status (name, motor, servo1, servo2, light)
+    else if (cmd == "statusM") {
+      MeshSerial.printf("name: %s\n", deviceName.c_str());
+      MeshSerial.printf("motor: %d\n", currentMotorSpeed);
+      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
+      MeshSerial.printf("servo2: %d\n", currentServo2Angle);
+
+      String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
+      MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
     }
     // ina: detailed power readings
     else if (cmd == "ina") {
