@@ -93,7 +93,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_C3_S1_INA3221_DS1307_TZ260325";
+const char* FIRMWARE_VERSION = "SoleraMesh_INA3221_DS1307_TZ260325B";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
