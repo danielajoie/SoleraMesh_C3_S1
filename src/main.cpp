@@ -37,6 +37,9 @@ void readTime();
 const int SERVO1_PIN = 5;
 const int SERVO2_PIN = 6;
 const int LED_PIN    = 7;
+const int LEDC_CHANNEL = 0;
+const int LEDC_FREQ = 5000;
+const int LEDC_RES = 8;
 
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
@@ -81,11 +84,25 @@ String deviceName;           // Customizable device name
 String groupName;            // Customizable group name
 String wifi_ssid;            // WiFi SSID
 String wifi_password;        // WiFi password
-unsigned long holdTime = 5000UL;  // ms: full power after no motion
-unsigned long dimTime  = 10000UL; // ms: dim level before off
-int dimLevel           = 50;      // %: dim brightness
 int8_t utcOffset = 0;        // UTC offset in hours (-12 to +12)
 bool observeDST = false;     // Observe daylight saving time
+
+// Load Power Set variables
+float sunsetThreshold = 4.0;     // Voltage threshold for sunset detection
+uint16_t motionWindow = 10000;   // Motion detection window in milliseconds (default 10 seconds)
+uint8_t sTime[9] = {2, 1, 0, 0, 0, 0, 0, 0, 0};  // Hours per segment (S-Time-1 to S-Time-9)
+uint8_t sCPow[9] = {80, 80, 0, 0, 0, 0, 0, 0, 0}; // Motion power % (S-C-Pow-1 to S-C-Pow-9)
+uint8_t sLPow[9] = {10, 20, 0, 0, 0, 0, 0, 0, 0}; // Idle power % (S-L-Pow-1 to S-L-Pow-9)
+
+// Load Power Set state machine
+enum LightMode { MODE_DAY, MODE_NIGHT };
+LightMode currentMode = MODE_DAY;
+uint8_t currentSegment = 0;       // 0-8 (segment index)
+unsigned long segmentStartTime = 0; // millis() when current segment started
+unsigned long sunsetDetectTime = 0; // millis() when sunset first detected
+unsigned long dawnDetectTime = 0;   // millis() when dawn first detected
+bool sunsetDetected = false;
+bool dawnDetected = false;
 
 // Defaults
 const char* DEFAULT_SSID     = "YourWiFiSSID";
@@ -93,7 +110,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_INA3221_DS1307_TZ260325B";
+const char* FIRMWARE_VERSION = "SoleraMesh_DtD260326A";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -147,15 +164,23 @@ void setup() {
   prefs.end();
 
   prefs.begin("light", false);
-  holdTime = prefs.getULong("holdtime", 5000UL);
-  dimTime  = prefs.getULong("dimtime",  10000UL);
-  dimLevel = prefs.getInt("dimlevel",   50);
   broadcastCooldown = prefs.getULong("broadcast", 5000UL);
   prefs.end();
 
   prefs.begin("timezone", false);
   utcOffset = prefs.getChar("offset", 0);
   observeDST = prefs.getBool("dst", false);
+  prefs.end();
+
+  // Load Load Power Set settings
+  prefs.begin("loadpower", false);
+  sunsetThreshold = prefs.getFloat("threshold", 4.0);
+  motionWindow = prefs.getUShort("motionwin", 10000);
+  for (uint8_t i = 0; i < 9; i++) {
+    sTime[i] = prefs.getUChar(("time" + String(i+1)).c_str(), (i < 2) ? ((i == 0) ? 2 : 1) : 0);
+    sCPow[i] = prefs.getUChar(("cpow" + String(i+1)).c_str(), (i < 2) ? 80 : 0);
+    sLPow[i] = prefs.getUChar(("lpow" + String(i+1)).c_str(), (i == 0) ? 10 : (i == 1) ? 20 : 0);
+  }
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -172,7 +197,11 @@ void setup() {
   pinMode(MOTOR_AIN2, OUTPUT);
   pinMode(PIR_PIN, INPUT);
 
-  analogWrite(LED_PIN, 0);
+  // Setup LEDC for LED PWM
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(LED_PIN, LEDC_CHANNEL);
+  ledcWrite(LEDC_CHANNEL, 0);
+
   analogWrite(MOTOR_AIN1, 0);
   analogWrite(MOTOR_AIN2, 0);
 
@@ -475,9 +504,6 @@ void saveWiFiCredentials() {
 
 void saveLightSettings() {
   prefs.begin("light", false);
-  prefs.putULong("holdtime", holdTime);
-  prefs.putULong("dimtime", dimTime);
-  prefs.putInt("dimlevel", dimLevel);
   prefs.putULong("broadcast", broadcastCooldown);
   prefs.end();
 }
@@ -486,6 +512,18 @@ void saveTimezoneSettings() {
   prefs.begin("timezone", false);
   prefs.putChar("offset", utcOffset);
   prefs.putBool("dst", observeDST);
+  prefs.end();
+}
+
+void saveLoadPowerSettings() {
+  prefs.begin("loadpower", false);
+  prefs.putFloat("threshold", sunsetThreshold);
+  prefs.putUShort("motionwin", motionWindow);
+  for (uint8_t i = 0; i < 9; i++) {
+    prefs.putUChar(("time" + String(i+1)).c_str(), sTime[i]);
+    prefs.putUChar(("cpow" + String(i+1)).c_str(), sCPow[i]);
+    prefs.putUChar(("lpow" + String(i+1)).c_str(), sLPow[i]);
+  }
   prefs.end();
 }
 
@@ -541,28 +579,94 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
 
-  // PIR + LED logic
+  // Load Power Set logic
   bool motionNow = digitalRead(PIR_PIN) == HIGH;
   if (motionNow) {
     lastMotionTime = millis();
-    analogWrite(LED_PIN, 255);
-    currentLedPwm = 255;
     if (groupName != "" && millis() - lastBroadcastTime >= broadcastCooldown) {
       MeshSerial.printf("%s:light:on\n", groupName.c_str());
       lastBroadcastTime = millis();
     }
-  } else {
-    unsigned long elapsed = millis() - lastMotionTime;
-    if (elapsed > holdTime + dimTime) {
-      analogWrite(LED_PIN, 0);
-      currentLedPwm = 0;
-    } else if (elapsed > holdTime) {
-      int dim = (dimLevel * 255) / 100;
-      analogWrite(LED_PIN, dim);
-      currentLedPwm = dim;
-    } else {
-      currentLedPwm = 255;
+  }
+
+  // Sunset/Dawn detection with 30-second hysteresis
+  if (inaBusV[0] < sunsetThreshold) {  // Solar voltage below threshold = sunset
+    if (!sunsetDetected) {
+      if (sunsetDetectTime == 0) {
+        sunsetDetectTime = millis();
+      } else if (millis() - sunsetDetectTime >= 30000) {  // 30 seconds
+        sunsetDetected = true;
+        dawnDetected = false;
+        currentMode = MODE_NIGHT;
+        currentSegment = 0;
+        segmentStartTime = millis();
+        Serial.println("Sunset detected - starting Load Power Set");
+      }
     }
+  } else {  // Solar voltage above threshold = dawn
+    if (!dawnDetected && currentMode == MODE_NIGHT) {
+      if (dawnDetectTime == 0) {
+        dawnDetectTime = millis();
+      } else if (millis() - dawnDetectTime >= 30000) {  // 30 seconds
+        dawnDetected = true;
+        sunsetDetected = false;
+        currentMode = MODE_DAY;
+        Serial.println("Dawn detected - stopping Load Power Set");
+      }
+    }
+  }
+
+  // Reset detection timers if voltage goes back above/below threshold
+  if (inaBusV[0] >= sunsetThreshold && sunsetDetectTime > 0) {
+    sunsetDetectTime = 0;
+  }
+  if (inaBusV[0] < sunsetThreshold && dawnDetectTime > 0) {
+    dawnDetectTime = 0;
+  }
+
+  // Load Power Set control logic
+  if (currentMode == MODE_NIGHT) {
+    // Check if current segment has expired
+    unsigned long segmentElapsed = millis() - segmentStartTime;
+    unsigned long segmentDurationMs = (unsigned long)sTime[currentSegment] * 3600000UL; // Convert hours to ms
+
+    if (segmentElapsed >= segmentDurationMs || sTime[currentSegment] == 0) {
+      // Move to next segment or end schedule
+      currentSegment++;
+      if (currentSegment >= 9 || sTime[currentSegment] == 0) {
+        // End of schedule - turn off light
+        currentMode = MODE_DAY;
+        ledcWrite(LEDC_CHANNEL, 0);
+        currentLedPwm = 0;
+        Serial.println("Load Power Set schedule completed");
+      } else {
+        // Start next segment
+        segmentStartTime = millis();
+        Serial.printf("Starting segment %d\n", currentSegment + 1);
+      }
+    }
+
+    if (currentMode == MODE_NIGHT) {
+      // Control LED based on motion and current segment
+      bool recentMotion = (millis() - lastMotionTime) < motionWindow;
+      uint8_t targetPower = recentMotion ? sCPow[currentSegment] : sLPow[currentSegment];
+      int pwmValue = (targetPower * 255) / 100;
+
+      // Debug output for LED power changes
+      static int lastPwmValue = -1;
+      if (pwmValue != lastPwmValue) {
+        Serial.printf("LED Power: %d%% (%d PWM) - %s\n",
+                     targetPower, pwmValue, recentMotion ? "motion" : "idle");
+        lastPwmValue = pwmValue;
+      }
+
+      ledcWrite(LEDC_CHANNEL, pwmValue);
+      currentLedPwm = pwmValue;
+    }
+  } else {
+    // Day mode - light off
+    ledcWrite(LEDC_CHANNEL, 0);
+    currentLedPwm = 0;
   }
 
   // WiFi reconnection logic (only if WiFi is enabled)
@@ -623,7 +727,7 @@ void loop() {
       state.toLowerCase();
       int val = (state=="on"||state=="1") ? 255 : (state=="off"||state=="0") ? 0 : state.toInt();
       if (val>=0 && val<=255) {
-        analogWrite(LED_PIN, val);
+        ledcWrite(LEDC_CHANNEL, val);
         currentLedPwm = val;
         MeshSerial.printf("light → %d\n", val);
         lastMotionTime = millis();  // reset motion timer
@@ -695,30 +799,7 @@ void loop() {
       saveDeviceIdentifiers();
       MeshSerial.printf("group → %s\n", groupName.c_str());
     }
-    else if (cmd.startsWith("holdtime:")) {
-      unsigned long val = cmd.substring(9).toInt();
-      if (val >= 1000 && val <= 600000) {
-        holdTime = val;
-        saveLightSettings();
-        MeshSerial.printf("holdtime → %lu\n", holdTime);
-      }
-    }
-    else if (cmd.startsWith("dimtime:")) {
-      unsigned long val = cmd.substring(8).toInt();
-      if (val >= 1000 && val <= 600000) {
-        dimTime = val;
-        saveLightSettings();
-        MeshSerial.printf("dimtime → %lu\n", dimTime);
-      }
-    }
-    else if (cmd.startsWith("dimlevel:")) {
-      int val = cmd.substring(9).toInt();
-      if (val >= 0 && val <= 100) {
-        dimLevel = val;
-        saveLightSettings();
-        MeshSerial.printf("dimlevel → %d\n", dimLevel);
-      }
-    }
+
     else if (cmd.startsWith("broadcast:")) {
       unsigned long val = cmd.substring(10).toInt();
       if (val >= 1000 && val <= 30000) {
@@ -732,9 +813,6 @@ void loop() {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("group: %s\n", groupName.c_str());
       MeshSerial.printf("ssid: %s\n", wifi_ssid.c_str());
-      MeshSerial.printf("holdtime: %lu\n", holdTime);
-      MeshSerial.printf("dimtime: %lu\n", dimTime);
-      MeshSerial.printf("dimlevel: %d\n", dimLevel);
       MeshSerial.printf("broadcast: %lu\n", broadcastCooldown);
       MeshSerial.printf("version: %s\n", FIRMWARE_VERSION);
     }
@@ -885,6 +963,122 @@ void loop() {
       MeshSerial.printf("timezone offset: %d hours\n", utcOffset);
       MeshSerial.printf("DST observation: %s\n", observeDST ? "on" : "off");
       MeshSerial.printf("current DST: %s\n", isDST() ? "active" : "inactive");
+    }
+    // statusL: Load Power Set status (mode, segment, power levels, timers)
+    else if (cmd == "statusL") {
+      MeshSerial.printf("name: %s\n", deviceName.c_str());
+      MeshSerial.printf("mode: %s\n", currentMode == MODE_DAY ? "DAY" : "NIGHT");
+      if (currentMode == MODE_NIGHT) {
+        MeshSerial.printf("segment: %d\n", currentSegment + 1);
+        unsigned long elapsed = millis() - segmentStartTime;
+        unsigned long remaining = (unsigned long)sTime[currentSegment] * 3600000UL - elapsed;
+        MeshSerial.printf("remaining: %lu min\n", remaining / 60000UL);
+        bool hasRecentMotion = (millis() - lastMotionTime) < motionWindow;
+        unsigned long timeSinceMotion = millis() - lastMotionTime;
+        MeshSerial.printf("motion: %s (%lu ms ago)\n", hasRecentMotion ? "YES" : "NO", timeSinceMotion);
+        MeshSerial.printf("power: %d%% (%s)\n", (currentLedPwm * 100) / 255,
+                         hasRecentMotion ? "motion" : "idle");
+      }
+      MeshSerial.printf("solar: %.2fV\n", inaBusV[0]);
+      MeshSerial.printf("threshold: %.1fV\n", sunsetThreshold);
+      MeshSerial.printf("motion window: %dms\n", motionWindow);
+    }
+    // parameterL: Load Power Set parameters
+    else if (cmd == "parameterL") {
+      MeshSerial.printf("threshold: %.1fV\n", sunsetThreshold);
+      for (uint8_t i = 0; i < 9; i++) {
+        if (sTime[i] > 0 || sCPow[i] > 0 || sLPow[i] > 0) {
+          MeshSerial.printf("S-Time-%d: %dH S-C-Pow%d: %d%% S-L-Pow%d: %d%%\n",
+                           i+1, sTime[i], i+1, sCPow[i], i+1, sLPow[i]);
+        }
+      }
+    }
+    // loadpower:set:S-Time-1:2 - Set segment parameters
+    else if (cmd.startsWith("loadpower:set:")) {
+      String paramStr = cmd.substring(14);
+      int colon1 = paramStr.indexOf(':');
+      if (colon1 > 0) {
+        String param = paramStr.substring(0, colon1);
+        int value = paramStr.substring(colon1 + 1).toInt();
+
+        bool valid = false;
+        if (param.startsWith("S-Time-")) {
+          int seg = param.substring(7).toInt() - 1;
+          if (seg >= 0 && seg < 9 && value >= 0 && value <= 24) {
+            sTime[seg] = value;
+            valid = true;
+          }
+        } else if (param.startsWith("S-C-Pow")) {
+          int seg = param.substring(8).toInt() - 1;
+          if (seg >= 0 && seg < 9 && value >= 0 && value <= 100) {
+            sCPow[seg] = value;
+            valid = true;
+          }
+        } else if (param.startsWith("S-L-Pow")) {
+          int seg = param.substring(8).toInt() - 1;
+          if (seg >= 0 && seg < 9 && value >= 0 && value <= 100) {
+            sLPow[seg] = value;
+            valid = true;
+          }
+        }
+
+        if (valid) {
+          saveLoadPowerSettings();
+          MeshSerial.printf("%s → %d\n", param.c_str(), value);
+        } else {
+          MeshSerial.println("Invalid parameter or value");
+        }
+      }
+    }
+    // loadpower - Display Load Power Set settings (compact, <200 bytes)
+    else if (cmd == "loadpower") {
+      MeshSerial.printf("LPS: %.1fV", sunsetThreshold);
+      for (uint8_t i = 0; i < 9; i++) {
+        if (sTime[i] > 0 || sCPow[i] > 0 || sLPow[i] > 0) {
+          MeshSerial.printf(" S%d:%dH-%d%%-%d%%", i+1, sTime[i], sCPow[i], sLPow[i]);
+        }
+      }
+      MeshSerial.printf("\n");
+    }
+    // sunset:threshold:4.0 - Set voltage threshold
+    else if (cmd.startsWith("sunset:threshold:")) {
+      float threshold = cmd.substring(17).toFloat();
+      if (threshold >= 1.0 && threshold <= 10.0) {
+        sunsetThreshold = threshold;
+        saveLoadPowerSettings();
+        MeshSerial.printf("sunset threshold → %.1fV\n", sunsetThreshold);
+      } else {
+        MeshSerial.println("Invalid threshold (1.0-10.0V)");
+      }
+    }
+    // motion:window:5000 - Set motion detection window in milliseconds
+    else if (cmd.startsWith("motion:window:")) {
+      uint16_t window = cmd.substring(13).toInt();
+      if (window >= 1000 && window <= 30000) {  // 1-30 seconds
+        motionWindow = window;
+        saveLoadPowerSettings();
+        MeshSerial.printf("motion window → %dms\n", motionWindow);
+      } else {
+        MeshSerial.println("Invalid window (1000-30000ms)");
+      }
+    }
+    // debug:lps - Debug Load Power Set state
+    else if (cmd == "debug:lps") {
+      MeshSerial.printf("LPS Debug:\n");
+      MeshSerial.printf("Mode: %s\n", currentMode == MODE_DAY ? "DAY" : "NIGHT");
+      MeshSerial.printf("Segment: %d\n", currentSegment + 1);
+      MeshSerial.printf("Motion now: %s\n", digitalRead(PIR_PIN) == HIGH ? "YES" : "NO");
+      MeshSerial.printf("Last motion: %lu ms ago\n", millis() - lastMotionTime);
+      MeshSerial.printf("Motion window: %d ms\n", motionWindow);
+      MeshSerial.printf("Recent motion: %s\n", (millis() - lastMotionTime) < motionWindow ? "YES" : "NO");
+      MeshSerial.printf("Target power: %d%% (%d PWM)\n",
+                       (millis() - lastMotionTime) < motionWindow ? sCPow[currentSegment] : sLPow[currentSegment],
+                       ((millis() - lastMotionTime) < motionWindow ? sCPow[currentSegment] : sLPow[currentSegment]) * 255 / 100);
+      MeshSerial.printf("Current PWM: %d\n", currentLedPwm);
+      MeshSerial.printf("Solar voltage: %.2fV\n", inaBusV[0]);
+      MeshSerial.printf("Threshold: %.1fV\n", sunsetThreshold);
+      MeshSerial.printf("Sunset detected: %s\n", sunsetDetected ? "YES" : "NO");
+      MeshSerial.printf("Dawn detected: %s\n", dawnDetected ? "YES" : "NO");
     }
   }
 }
