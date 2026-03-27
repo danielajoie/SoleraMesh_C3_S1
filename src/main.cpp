@@ -90,6 +90,9 @@ bool observeDST = false;     // Observe daylight saving time
 // Load Power Set variables
 float sunsetThreshold = 4.0;     // Voltage threshold for sunset detection
 uint16_t motionWindow = 10000;   // Motion detection window in milliseconds (default 10 seconds)
+uint8_t startMode = 0;           // 0=dusk (voltage), 1=fixed time (RTC)
+uint8_t startHour = 18;          // Fixed start hour (0-23) for RTC mode
+uint8_t startMinute = 0;         // Fixed start minute (0-59) for RTC mode
 uint8_t sTime[9] = {2, 1, 0, 0, 0, 0, 0, 0, 0};  // Hours per segment (S-Time-1 to S-Time-9)
 uint8_t sCPow[9] = {80, 80, 0, 0, 0, 0, 0, 0, 0}; // Motion power % (S-C-Pow-1 to S-C-Pow-9)
 uint8_t sLPow[9] = {10, 20, 0, 0, 0, 0, 0, 0, 0}; // Idle power % (S-L-Pow-1 to S-L-Pow-9)
@@ -110,7 +113,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_DtD260326A";
+const char* FIRMWARE_VERSION = "SoleraMesh_RTCtD260326A";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -176,6 +179,9 @@ void setup() {
   prefs.begin("loadpower", false);
   sunsetThreshold = prefs.getFloat("threshold", 4.0);
   motionWindow = prefs.getUShort("motionwin", 10000);
+  startMode = prefs.getUChar("startmode", 0);
+  startHour = prefs.getUChar("starthour", 18);
+  startMinute = prefs.getUChar("startmin", 0);
   for (uint8_t i = 0; i < 9; i++) {
     sTime[i] = prefs.getUChar(("time" + String(i+1)).c_str(), (i < 2) ? ((i == 0) ? 2 : 1) : 0);
     sCPow[i] = prefs.getUChar(("cpow" + String(i+1)).c_str(), (i < 2) ? 80 : 0);
@@ -519,6 +525,9 @@ void saveLoadPowerSettings() {
   prefs.begin("loadpower", false);
   prefs.putFloat("threshold", sunsetThreshold);
   prefs.putUShort("motionwin", motionWindow);
+  prefs.putUChar("startmode", startMode);
+  prefs.putUChar("starthour", startHour);
+  prefs.putUChar("startmin", startMinute);
   for (uint8_t i = 0; i < 9; i++) {
     prefs.putUChar(("time" + String(i+1)).c_str(), sTime[i]);
     prefs.putUChar(("cpow" + String(i+1)).c_str(), sCPow[i]);
@@ -589,39 +598,72 @@ void loop() {
     }
   }
 
-  // Sunset/Dawn detection with 30-second hysteresis
-  if (inaBusV[0] < sunsetThreshold) {  // Solar voltage below threshold = sunset
-    if (!sunsetDetected) {
-      if (sunsetDetectTime == 0) {
-        sunsetDetectTime = millis();
-      } else if (millis() - sunsetDetectTime >= 30000) {  // 30 seconds
-        sunsetDetected = true;
-        dawnDetected = false;
+  // Load Power Set DAY/NIGHT transition logic
+  if (startMode == 0) {  // Dusk mode - solar voltage detection
+    if (inaBusV[0] < sunsetThreshold) {  // Solar voltage below threshold = sunset
+      if (!sunsetDetected) {
+        if (sunsetDetectTime == 0) {
+          sunsetDetectTime = millis();
+        } else if (millis() - sunsetDetectTime >= 30000) {  // 30 seconds
+          sunsetDetected = true;
+          dawnDetected = false;
+          currentMode = MODE_NIGHT;
+          currentSegment = 0;
+          segmentStartTime = millis();
+          Serial.println("Sunset detected - starting Load Power Set");
+        }
+      }
+    } else {  // Solar voltage above threshold = dawn
+      if (!dawnDetected && currentMode == MODE_NIGHT) {
+        if (dawnDetectTime == 0) {
+          dawnDetectTime = millis();
+        } else if (millis() - dawnDetectTime >= 30000) {  // 30 seconds
+          dawnDetected = true;
+          sunsetDetected = false;
+          currentMode = MODE_DAY;
+          Serial.println("Dawn detected - stopping Load Power Set");
+        }
+      }
+    }
+
+    // Reset detection timers if voltage goes back above/below threshold
+    if (inaBusV[0] >= sunsetThreshold && sunsetDetectTime > 0) {
+      sunsetDetectTime = 0;
+    }
+    if (inaBusV[0] < sunsetThreshold && dawnDetectTime > 0) {
+      dawnDetectTime = 0;
+    }
+  } else {  // Fixed time mode - RTC based
+    if (ds1307Present) {
+      // Calculate local time
+      int8_t totalOffset = utcOffset;
+      if (isDST()) totalOffset += 1;
+      int localHour = currentTime.hour + totalOffset;
+      int localMinute = currentTime.minute;
+
+      // Handle hour rollover
+      if (localHour >= 24) {
+        localHour -= 24;
+      } else if (localHour < 0) {
+        localHour += 24;
+      }
+
+      // Check if current local time >= start time
+      bool isStartTime = (localHour > startHour) ||
+                        (localHour == startHour && localMinute >= startMinute);
+
+      if (isStartTime && currentMode == MODE_DAY) {
+        // Start NIGHT mode
         currentMode = MODE_NIGHT;
         currentSegment = 0;
         segmentStartTime = millis();
-        Serial.println("Sunset detected - starting Load Power Set");
-      }
-    }
-  } else {  // Solar voltage above threshold = dawn
-    if (!dawnDetected && currentMode == MODE_NIGHT) {
-      if (dawnDetectTime == 0) {
-        dawnDetectTime = millis();
-      } else if (millis() - dawnDetectTime >= 30000) {  // 30 seconds
-        dawnDetected = true;
-        sunsetDetected = false;
+        Serial.println("Fixed time reached - starting Load Power Set");
+      } else if (!isStartTime && currentMode == MODE_NIGHT) {
+        // End NIGHT mode (next day)
         currentMode = MODE_DAY;
-        Serial.println("Dawn detected - stopping Load Power Set");
+        Serial.println("Fixed time cycle completed - stopping Load Power Set");
       }
     }
-  }
-
-  // Reset detection timers if voltage goes back above/below threshold
-  if (inaBusV[0] >= sunsetThreshold && sunsetDetectTime > 0) {
-    sunsetDetectTime = 0;
-  }
-  if (inaBusV[0] < sunsetThreshold && dawnDetectTime > 0) {
-    dawnDetectTime = 0;
   }
 
   // Load Power Set control logic
@@ -979,13 +1021,22 @@ void loop() {
         MeshSerial.printf("power: %d%% (%s)\n", (currentLedPwm * 100) / 255,
                          hasRecentMotion ? "motion" : "idle");
       }
+      MeshSerial.printf("start mode: %s\n", startMode == 0 ? "dusk" : "fixed time");
+      if (startMode == 1) {
+        MeshSerial.printf("start time: %02d:%02d\n", startHour, startMinute);
+      }
       MeshSerial.printf("solar: %.2fV\n", inaBusV[0]);
       MeshSerial.printf("threshold: %.1fV\n", sunsetThreshold);
       MeshSerial.printf("motion window: %dms\n", motionWindow);
     }
     // parameterL: Load Power Set parameters
     else if (cmd == "parameterL") {
+      MeshSerial.printf("start mode: %s\n", startMode == 0 ? "dusk" : "fixed time");
+      if (startMode == 1) {
+        MeshSerial.printf("start time: %02d:%02d\n", startHour, startMinute);
+      }
       MeshSerial.printf("threshold: %.1fV\n", sunsetThreshold);
+      MeshSerial.printf("motion window: %dms\n", motionWindow);
       for (uint8_t i = 0; i < 9; i++) {
         if (sTime[i] > 0 || sCPow[i] > 0 || sLPow[i] > 0) {
           MeshSerial.printf("S-Time-%d: %dH S-C-Pow%d: %d%% S-L-Pow%d: %d%%\n",
@@ -1061,6 +1112,44 @@ void loop() {
       } else {
         MeshSerial.println("Invalid window (1000-30000ms)");
       }
+    }
+    // startmode:0 or startmode:1 - Set start mode (0=dusk, 1=fixed time)
+    else if (cmd.startsWith("startmode:")) {
+      uint8_t mode = cmd.substring(10).toInt();
+      if (mode == 0 || mode == 1) {
+        startMode = mode;
+        saveLoadPowerSettings();
+        MeshSerial.printf("start mode → %s\n", startMode == 0 ? "dusk" : "fixed time");
+      } else {
+        MeshSerial.println("Invalid mode (0=dusk, 1=fixed time)");
+      }
+    }
+    // starttime:18:30 - Set fixed start time (HH:MM)
+    else if (cmd.startsWith("starttime:")) {
+      String timeStr = cmd.substring(10);
+      int colon = timeStr.indexOf(':');
+      if (colon > 0) {
+        int hour = timeStr.substring(0, colon).toInt();
+        int minute = timeStr.substring(colon + 1).toInt();
+        if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+          startHour = hour;
+          startMinute = minute;
+          saveLoadPowerSettings();
+          MeshSerial.printf("start time → %02d:%02d\n", startHour, startMinute);
+        } else {
+          MeshSerial.println("Invalid time (00:00-23:59)");
+        }
+      } else {
+        MeshSerial.println("Invalid format (use HH:MM)");
+      }
+    }
+    // startmode - Get current start mode
+    else if (cmd == "startmode") {
+      MeshSerial.printf("start mode: %s\n", startMode == 0 ? "dusk" : "fixed time");
+    }
+    // starttime - Get current start time
+    else if (cmd == "starttime") {
+      MeshSerial.printf("start time: %02d:%02d\n", startHour, startMinute);
     }
     // debug:lps - Debug Load Power Set state
     else if (cmd == "debug:lps") {
