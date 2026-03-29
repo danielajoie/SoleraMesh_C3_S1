@@ -20,6 +20,7 @@ Date: March 2026
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <Adafruit_AHTX0.h>
 
 // Function prototypes
 void attemptWiFiConnect();
@@ -48,6 +49,7 @@ const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX
 const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX
 
 const int PIR_PIN = 4;       // PIR motion sensor
+const int RELAY_PIN = 10;    // Solar charging relay control
 
 // INA3221 configuration
 #define SHUNT_RESISTOR 0.1  // Ohms
@@ -113,7 +115,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_RTCtD260326A";
+const char* FIRMWARE_VERSION = "SoleraMesh_AdvancedRTC4x";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -135,6 +137,22 @@ Servo servo1;
 Servo servo2;
 bool otaInitialized = false;
 Preferences prefs;
+
+// AHT30 temperature/humidity sensor
+Adafruit_AHTX0 aht30;
+float currentTemperature = 0.0;
+float currentHumidity = 0.0;
+bool aht30Present = false;
+
+// Battery charging control
+enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
+BatteryChemistry batteryChemistry = BAT_LI_ION;  // Default to Li-ion
+float chargeTempMin = 0.0;    // Minimum temperature for charging (°C)
+float chargeTempMax = 45.0;   // Maximum temperature for charging (°C)
+bool chargingEnabled = false; // Current charging state
+enum ChargingStatus { CHG_DISABLED, CHG_ENABLED, CHG_ERROR_TEMP_LOW, CHG_ERROR_TEMP_HIGH, CHG_ERROR_SENSOR };
+ChargingStatus chargingStatus = CHG_DISABLED;
+unsigned long lastChargingStatusChange = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -189,6 +207,13 @@ void setup() {
   }
   prefs.end();
 
+  // Load charging settings
+  prefs.begin("charging", false);
+  batteryChemistry = (BatteryChemistry)prefs.getUChar("chemistry", BAT_LI_ION);
+  chargeTempMin = prefs.getFloat("tempmin", 0.0);
+  chargeTempMax = prefs.getFloat("tempmax", 45.0);
+  prefs.end();
+
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
                     deviceUID.c_str(), deviceName.c_str(), groupName.c_str());
 
@@ -202,6 +227,8 @@ void setup() {
   pinMode(MOTOR_AIN1, OUTPUT);
   pinMode(MOTOR_AIN2, OUTPUT);
   pinMode(PIR_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
 
   // Setup LEDC for LED PWM
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
@@ -264,6 +291,21 @@ void setup() {
     Serial.println("DS1307 Initialized");
   } else {
     Serial.println("DS1307 RTC not found");
+  }
+
+  // Initialize AHT30 temperature/humidity sensor
+  if (aht30.begin()) {
+    aht30Present = true;
+    Serial.println("AHT30 sensor found");
+
+    // Initial reading
+    sensors_event_t humidity, temp;
+    aht30.getEvent(&humidity, &temp);
+    currentTemperature = temp.temperature;
+    currentHumidity = humidity.relative_humidity;
+    Serial.printf("AHT30 Initial: %.1f°C, %.1f%%\n", currentTemperature, currentHumidity);
+  } else {
+    Serial.println("AHT30 sensor not found");
   }
 }
 
@@ -575,6 +617,7 @@ void setupOTA() {
 void loop() {
   static unsigned long lastINARead = 0;
   static unsigned long lastTimeRead = 0;
+  static unsigned long lastAHTRead = 0;
 
   if (millis() - lastINARead >= 5000) {  // Read every 5 seconds
     readINA3221();
@@ -584,6 +627,65 @@ void loop() {
   if (millis() - lastTimeRead >= 1000) {  // Read time every second
     readTime();
     lastTimeRead = millis();
+  }
+
+  if (millis() - lastAHTRead >= 10000 && aht30Present) {  // Read every 10 seconds
+    sensors_event_t humidity, temp;
+    aht30.getEvent(&humidity, &temp);
+    currentTemperature = temp.temperature;
+    currentHumidity = humidity.relative_humidity;
+    Serial.printf("AHT30: %.1f°C, %.1f%%\n", currentTemperature, currentHumidity);
+
+    // Temperature-aware charging control
+    ChargingStatus newStatus = CHG_DISABLED;
+    if (!aht30Present) {
+      newStatus = CHG_ERROR_SENSOR;
+    } else if (currentTemperature < chargeTempMin) {
+      newStatus = CHG_ERROR_TEMP_LOW;
+    } else if (currentTemperature > chargeTempMax) {
+      newStatus = CHG_ERROR_TEMP_HIGH;
+    } else {
+      newStatus = CHG_ENABLED;
+    }
+
+    // Update charging state if status changed
+    if (newStatus != chargingStatus) {
+      chargingStatus = newStatus;
+      lastChargingStatusChange = millis();
+
+      switch (chargingStatus) {
+        case CHG_ENABLED:
+          digitalWrite(RELAY_PIN, HIGH);
+          chargingEnabled = true;
+          Serial.printf("Charging ENABLED (Temp: %.1f°C in range %.1f-%.1f°C)\n",
+                       currentTemperature, chargeTempMin, chargeTempMax);
+          break;
+        case CHG_ERROR_TEMP_LOW:
+          digitalWrite(RELAY_PIN, LOW);
+          chargingEnabled = false;
+          Serial.printf("Charging DISABLED - Temperature too LOW (%.1f°C < %.1f°C)\n",
+                       currentTemperature, chargeTempMin);
+          break;
+        case CHG_ERROR_TEMP_HIGH:
+          digitalWrite(RELAY_PIN, LOW);
+          chargingEnabled = false;
+          Serial.printf("Charging DISABLED - Temperature too HIGH (%.1f°C > %.1f°C)\n",
+                       currentTemperature, chargeTempMax);
+          break;
+        case CHG_ERROR_SENSOR:
+          digitalWrite(RELAY_PIN, LOW);
+          chargingEnabled = false;
+          Serial.println("Charging DISABLED - Temperature sensor not available");
+          break;
+        default:
+          digitalWrite(RELAY_PIN, LOW);
+          chargingEnabled = false;
+          Serial.println("Charging DISABLED - Unknown error");
+          break;
+      }
+    }
+
+    lastAHTRead = millis();
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -888,6 +990,17 @@ void loop() {
       int tzAbs = abs(utcOffset);
       MeshSerial.printf("timezone: UTC%c%d, DST=%s (%s)\n", tzSign, tzAbs,
                        observeDST ? "on" : "off", isDST() ? "active" : "inactive");
+
+      // Charging status
+      String chgStatus;
+      switch (chargingStatus) {
+        case CHG_ENABLED: chgStatus = "ON"; break;
+        case CHG_ERROR_TEMP_LOW: chgStatus = "TEMP_LOW"; break;
+        case CHG_ERROR_TEMP_HIGH: chgStatus = "TEMP_HIGH"; break;
+        case CHG_ERROR_SENSOR: chgStatus = "SENSOR_ERROR"; break;
+        default: chgStatus = "OFF"; break;
+      }
+      MeshSerial.printf("charging: %s %.1f°C\n", chgStatus.c_str(), currentTemperature);
     }
     // statusP: power status (name, solar, battery, led_load)
     else if (cmd == "statusP") {
@@ -1168,6 +1281,87 @@ void loop() {
       MeshSerial.printf("Threshold: %.1fV\n", sunsetThreshold);
       MeshSerial.printf("Sunset detected: %s\n", sunsetDetected ? "YES" : "NO");
       MeshSerial.printf("Dawn detected: %s\n", dawnDetected ? "YES" : "NO");
+    }
+    // charging:chemistry:li-ion or charging:chemistry:lead-acid - Set battery chemistry
+    else if (cmd.startsWith("charging:chemistry:")) {
+      String chemistry = cmd.substring(19);
+      chemistry.toLowerCase();
+      if (chemistry == "li-ion" || chemistry == "li_ion") {
+        batteryChemistry = BAT_LI_ION;
+        chargeTempMin = 0.0;
+        chargeTempMax = 45.0;
+        // Save to preferences
+        prefs.begin("charging", false);
+        prefs.putUChar("chemistry", batteryChemistry);
+        prefs.putFloat("tempmin", chargeTempMin);
+        prefs.putFloat("tempmax", chargeTempMax);
+        prefs.end();
+        MeshSerial.printf("battery chemistry → Li-ion (0-45°C)\n");
+      } else if (chemistry == "lead-acid" || chemistry == "lead_acid") {
+        batteryChemistry = BAT_LEAD_ACID;
+        chargeTempMin = -20.0;
+        chargeTempMax = 50.0;
+        // Save to preferences
+        prefs.begin("charging", false);
+        prefs.putUChar("chemistry", batteryChemistry);
+        prefs.putFloat("tempmin", chargeTempMin);
+        prefs.putFloat("tempmax", chargeTempMax);
+        prefs.end();
+        MeshSerial.printf("battery chemistry → Lead-acid (-20-50°C)\n");
+      } else {
+        MeshSerial.println("Use 'li-ion' or 'lead-acid'");
+      }
+    }
+    // charging:chemistry - Get current battery chemistry
+    else if (cmd == "charging:chemistry") {
+      String chemName = (batteryChemistry == BAT_LI_ION) ? "Li-ion" : "Lead-acid";
+      MeshSerial.printf("battery chemistry: %s\n", chemName.c_str());
+    }
+    // charging:tempmin:VALUE - Set minimum charging temperature
+    else if (cmd.startsWith("charging:tempmin:")) {
+      float temp = cmd.substring(18).toFloat();
+      if (temp >= -50.0 && temp <= 50.0 && temp < chargeTempMax) {
+        chargeTempMin = temp;
+        prefs.begin("charging", false);
+        prefs.putFloat("tempmin", chargeTempMin);
+        prefs.end();
+        MeshSerial.printf("charge temp min → %.1f°C\n", chargeTempMin);
+      } else {
+        MeshSerial.println("Invalid temp (-50 to 50°C, < max)");
+      }
+    }
+    // charging:tempmax:VALUE - Set maximum charging temperature
+    else if (cmd.startsWith("charging:tempmax:")) {
+      float temp = cmd.substring(18).toFloat();
+      if (temp >= -50.0 && temp <= 80.0 && temp > chargeTempMin) {
+        chargeTempMax = temp;
+        prefs.begin("charging", false);
+        prefs.putFloat("tempmax", chargeTempMax);
+        prefs.end();
+        MeshSerial.printf("charge temp max → %.1f°C\n", chargeTempMax);
+      } else {
+        MeshSerial.println("Invalid temp (-50 to 80°C, > min)");
+      }
+    }
+    // charging:status - Get current charging status
+    else if (cmd == "charging:status") {
+      String statusStr;
+      switch (chargingStatus) {
+        case CHG_ENABLED: statusStr = "ENABLED"; break;
+        case CHG_ERROR_TEMP_LOW: statusStr = "TEMP_LOW"; break;
+        case CHG_ERROR_TEMP_HIGH: statusStr = "TEMP_HIGH"; break;
+        case CHG_ERROR_SENSOR: statusStr = "SENSOR_ERROR"; break;
+        default: statusStr = "DISABLED"; break;
+      }
+      MeshSerial.printf("charging: %s %.1f°C relay:%s\n",
+                       statusStr.c_str(), currentTemperature,
+                       chargingEnabled ? "ON" : "OFF");
+    }
+    // charging:parameter - Get all charging parameters
+    else if (cmd == "charging:parameter") {
+      String chemName = (batteryChemistry == BAT_LI_ION) ? "Li-ion" : "Lead-acid";
+      MeshSerial.printf("chemistry:%s temp:%.1f-%.1f°C\n",
+                       chemName.c_str(), chargeTempMin, chargeTempMax);
     }
   }
 }
