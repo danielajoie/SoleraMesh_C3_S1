@@ -95,7 +95,26 @@ uint16_t motionWindow = 10000;   // Motion detection window in milliseconds (def
 uint8_t startMode = 0;           // 0=dusk (voltage), 1=fixed time (RTC)
 uint8_t startHour = 18;          // Fixed start hour (0-23) for RTC mode
 uint8_t startMinute = 0;         // Fixed start minute (0-59) for RTC mode
-uint8_t sTime[9] = {2, 1, 0, 0, 0, 0, 0, 0, 0};  // Hours per segment (S-Time-1 to S-Time-9)
+
+// Enhanced S-Time structure supporting both timer and RTC modes
+struct SegmentTime {
+  bool isRTCTime;      // true = HH:MM format, false = hours timer
+  union {
+    uint8_t hours;     // 0-24 for timer mode
+    struct {
+      uint8_t hour;    // 0-23 for RTC mode
+      uint8_t minute;  // 0-59 for RTC mode
+    } rtcTime;
+  } value;
+};
+
+// Initialize with default values (timer mode)
+SegmentTime sTime[9] = {
+  {false, {2}},   // Segment 1: 2 hours timer
+  {false, {1}},   // Segment 2: 1 hour timer
+  {false, {0}}, {false, {0}}, {false, {0}}, {false, {0}}, {false, {0}}, {false, {0}}, {false, {0}}
+};
+
 uint8_t sCPow[9] = {80, 80, 0, 0, 0, 0, 0, 0, 0}; // Motion power % (S-C-Pow-1 to S-C-Pow-9)
 uint8_t sLPow[9] = {10, 20, 0, 0, 0, 0, 0, 0, 0}; // Idle power % (S-L-Pow-1 to S-L-Pow-9)
 
@@ -115,7 +134,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_AdvancedRTC4x";
+const char* FIRMWARE_VERSION = "SoleraMesh_STimeRTC";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -200,8 +219,12 @@ void setup() {
   startMode = prefs.getUChar("startmode", 0);
   startHour = prefs.getUChar("starthour", 18);
   startMinute = prefs.getUChar("startmin", 0);
+  // For now, load as simple timer values (backward compatibility)
+  // TODO: Implement proper SegmentTime serialization
   for (uint8_t i = 0; i < 9; i++) {
-    sTime[i] = prefs.getUChar(("time" + String(i+1)).c_str(), (i < 2) ? ((i == 0) ? 2 : 1) : 0);
+    uint8_t hours = prefs.getUChar(("time" + String(i+1)).c_str(), (i < 2) ? ((i == 0) ? 2 : 1) : 0);
+    sTime[i].isRTCTime = false;  // Default to timer mode
+    sTime[i].value.hours = hours;
     sCPow[i] = prefs.getUChar(("cpow" + String(i+1)).c_str(), (i < 2) ? 80 : 0);
     sLPow[i] = prefs.getUChar(("lpow" + String(i+1)).c_str(), (i == 0) ? 10 : (i == 1) ? 20 : 0);
   }
@@ -570,8 +593,11 @@ void saveLoadPowerSettings() {
   prefs.putUChar("startmode", startMode);
   prefs.putUChar("starthour", startHour);
   prefs.putUChar("startmin", startMinute);
+  // For now, save as simple timer values (backward compatibility)
+  // TODO: Implement proper SegmentTime serialization
   for (uint8_t i = 0; i < 9; i++) {
-    prefs.putUChar(("time" + String(i+1)).c_str(), sTime[i]);
+    uint8_t hours = sTime[i].isRTCTime ? 0 : sTime[i].value.hours;  // Save 0 for RTC times
+    prefs.putUChar(("time" + String(i+1)).c_str(), hours);
     prefs.putUChar(("cpow" + String(i+1)).c_str(), sCPow[i]);
     prefs.putUChar(("lpow" + String(i+1)).c_str(), sLPow[i]);
   }
@@ -771,18 +797,50 @@ void loop() {
   // Load Power Set control logic
   if (currentMode == MODE_NIGHT) {
     // Check if current segment has expired
-    unsigned long segmentElapsed = millis() - segmentStartTime;
-    unsigned long segmentDurationMs = (unsigned long)sTime[currentSegment] * 3600000UL; // Convert hours to ms
+    bool segmentExpired = false;
 
-    if (segmentElapsed >= segmentDurationMs || sTime[currentSegment] == 0) {
+    if (sTime[currentSegment].isRTCTime) {
+      // RTC time mode - check if current time >= target time
+      int8_t totalOffset = utcOffset;
+      if (isDST()) totalOffset += 1;
+      int localHour = currentTime.hour + totalOffset;
+      int localMinute = currentTime.minute;
+
+      // Handle hour rollover
+      if (localHour >= 24) {
+        localHour -= 24;
+      } else if (localHour < 0) {
+        localHour += 24;
+      }
+
+      // Check if current time >= target time
+      if (localHour > sTime[currentSegment].value.rtcTime.hour ||
+          (localHour == sTime[currentSegment].value.rtcTime.hour &&
+           localMinute >= sTime[currentSegment].value.rtcTime.minute)) {
+        segmentExpired = true;
+      }
+    } else {
+      // Timer mode - check elapsed time
+      unsigned long segmentElapsed = millis() - segmentStartTime;
+      unsigned long segmentDurationMs = (unsigned long)sTime[currentSegment].value.hours * 3600000UL;
+      if (segmentElapsed >= segmentDurationMs) {
+        segmentExpired = true;
+      }
+    }
+
+    // Check for zero/empty segment (end of schedule)
+    bool isEmptySegment = (!sTime[currentSegment].isRTCTime && sTime[currentSegment].value.hours == 0);
+
+    if (segmentExpired || isEmptySegment) {
       // Move to next segment or end schedule
       currentSegment++;
-      if (currentSegment >= 9 || sTime[currentSegment] == 0) {
-        // End of schedule - turn off light
+      if (currentSegment >= 9 || (!sTime[currentSegment].isRTCTime && sTime[currentSegment].value.hours == 0)) {
+        // End of schedule - turn off light and send completion message
         currentMode = MODE_DAY;
         ledcWrite(LEDC_CHANNEL, 0);
         currentLedPwm = 0;
         Serial.println("Load Power Set schedule completed");
+        MeshSerial.println("All segments complete");
       } else {
         // Start next segment
         segmentStartTime = millis();
@@ -1125,9 +1183,24 @@ void loop() {
       MeshSerial.printf("mode: %s\n", currentMode == MODE_DAY ? "DAY" : "NIGHT");
       if (currentMode == MODE_NIGHT) {
         MeshSerial.printf("segment: %d\n", currentSegment + 1);
-        unsigned long elapsed = millis() - segmentStartTime;
-        unsigned long remaining = (unsigned long)sTime[currentSegment] * 3600000UL - elapsed;
-        MeshSerial.printf("remaining: %lu min\n", remaining / 60000UL);
+
+        // Calculate remaining time based on segment type
+        String remainingStr;
+        if (sTime[currentSegment].isRTCTime) {
+          // RTC mode - show target time
+          remainingStr = String("until ") + (sTime[currentSegment].value.rtcTime.hour < 10 ? "0" : "") +
+                        String(sTime[currentSegment].value.rtcTime.hour) + ":" +
+                        (sTime[currentSegment].value.rtcTime.minute < 10 ? "0" : "") +
+                        String(sTime[currentSegment].value.rtcTime.minute);
+        } else {
+          // Timer mode - show remaining minutes
+          unsigned long elapsed = millis() - segmentStartTime;
+          unsigned long segmentDurationMs = (unsigned long)sTime[currentSegment].value.hours * 3600000UL;
+          unsigned long remaining = segmentDurationMs - elapsed;
+          remainingStr = String(remaining / 60000UL) + " min";
+        }
+        MeshSerial.printf("remaining: %s\n", remainingStr.c_str());
+
         bool hasRecentMotion = (millis() - lastMotionTime) < motionWindow;
         unsigned long timeSinceMotion = millis() - lastMotionTime;
         MeshSerial.printf("motion: %s (%lu ms ago)\n", hasRecentMotion ? "YES" : "NO", timeSinceMotion);
@@ -1151,9 +1224,24 @@ void loop() {
       MeshSerial.printf("threshold: %.1fV\n", sunsetThreshold);
       MeshSerial.printf("motion window: %dms\n", motionWindow);
       for (uint8_t i = 0; i < 9; i++) {
-        if (sTime[i] > 0 || sCPow[i] > 0 || sLPow[i] > 0) {
-          MeshSerial.printf("S-Time-%d: %dH S-C-Pow%d: %d%% S-L-Pow%d: %d%%\n",
-                           i+1, sTime[i], i+1, sCPow[i], i+1, sLPow[i]);
+        bool hasData = false;
+        if (sTime[i].isRTCTime) {
+          hasData = true;
+        } else if (sTime[i].value.hours > 0) {
+          hasData = true;
+        }
+        if (hasData || sCPow[i] > 0 || sLPow[i] > 0) {
+          String timeStr;
+          if (sTime[i].isRTCTime) {
+            timeStr = String(sTime[i].value.rtcTime.hour < 10 ? "0" : "") +
+                     String(sTime[i].value.rtcTime.hour) + ":" +
+                     String(sTime[i].value.rtcTime.minute < 10 ? "0" : "") +
+                     String(sTime[i].value.rtcTime.minute);
+          } else {
+            timeStr = String(sTime[i].value.hours) + "H";
+          }
+          MeshSerial.printf("S-Time-%d: %s S-C-Pow%d: %d%% S-L-Pow%d: %d%%\n",
+                           i+1, timeStr.c_str(), i+1, sCPow[i], i+1, sLPow[i]);
         }
       }
     }
@@ -1168,9 +1256,31 @@ void loop() {
         bool valid = false;
         if (param.startsWith("S-Time-")) {
           int seg = param.substring(7).toInt() - 1;
-          if (seg >= 0 && seg < 9 && value >= 0 && value <= 24) {
-            sTime[seg] = value;
-            valid = true;
+          if (seg >= 0 && seg < 9) {
+            // Check if value contains ':' (HH:MM format) or is plain number (hours)
+            String valStr = paramStr.substring(colon1 + 1);
+            int colonPos = valStr.indexOf(':');
+            if (colonPos > 0) {
+              // RTC time format HH:MM
+              int hour = valStr.substring(0, colonPos).toInt();
+              int minute = valStr.substring(colonPos + 1).toInt();
+              if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+                sTime[seg].isRTCTime = true;
+                sTime[seg].value.rtcTime.hour = hour;
+                sTime[seg].value.rtcTime.minute = minute;
+                valid = true;
+                MeshSerial.printf("S-Time-%d → %02d:%02d\n", seg+1, hour, minute);
+              }
+            } else {
+              // Timer format (hours)
+              int hours = valStr.toInt();
+              if (hours >= 0 && hours <= 24) {
+                sTime[seg].isRTCTime = false;
+                sTime[seg].value.hours = hours;
+                valid = true;
+                MeshSerial.printf("S-Time-%d → %dH\n", seg+1, hours);
+              }
+            }
           }
         } else if (param.startsWith("S-C-Pow")) {
           int seg = param.substring(8).toInt() - 1;
@@ -1198,8 +1308,23 @@ void loop() {
     else if (cmd == "loadpower") {
       MeshSerial.printf("LPS: %.1fV", sunsetThreshold);
       for (uint8_t i = 0; i < 9; i++) {
-        if (sTime[i] > 0 || sCPow[i] > 0 || sLPow[i] > 0) {
-          MeshSerial.printf(" S%d:%dH-%d%%-%d%%", i+1, sTime[i], sCPow[i], sLPow[i]);
+        bool hasData = false;
+        if (sTime[i].isRTCTime) {
+          hasData = true;
+        } else if (sTime[i].value.hours > 0) {
+          hasData = true;
+        }
+        if (hasData || sCPow[i] > 0 || sLPow[i] > 0) {
+          String timeStr;
+          if (sTime[i].isRTCTime) {
+            timeStr = String(sTime[i].value.rtcTime.hour < 10 ? "0" : "") +
+                     String(sTime[i].value.rtcTime.hour) + ":" +
+                     String(sTime[i].value.rtcTime.minute < 10 ? "0" : "") +
+                     String(sTime[i].value.rtcTime.minute);
+          } else {
+            timeStr = String(sTime[i].value.hours) + "H";
+          }
+          MeshSerial.printf(" S%d:%s-%d%%-%d%%", i+1, timeStr.c_str(), sCPow[i], sLPow[i]);
         }
       }
       MeshSerial.printf("\n");
