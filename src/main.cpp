@@ -1,5 +1,5 @@
 /*
-Project name: SoleraMesh_C3_S1 - Meshtastic-integrated ESP32-C3 Controller
+Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
 - Servo1: GPIO 5 (PWM channel 0)
@@ -11,7 +11,7 @@ Hardware/pins:
 - UART: GPIO 3 (RX) / GPIO 2 (TX) for Meshtastic
 - I2C: GPIO 8 (SDA) / GPIO 9 (SCL) for INA3221
 Libraries: WiFi, ArduinoOTA, Preferences, Wire
-Date: March 2026
+Date: April 2026
 */
 
 #include <Arduino.h>
