@@ -45,8 +45,8 @@ const int LEDC_RES = 8;
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
 
-const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX
-const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX
+const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX 21
+const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX 19
 
 const int PIR_PIN = 4;       // PIR motion sensor
 const int RELAY_PIN = 10;    // Solar charging relay control
@@ -134,7 +134,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_STimeRTC";
+const char* FIRMWARE_VERSION = "Core-ESP32-C3_MT_260410a";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
