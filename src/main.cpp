@@ -2,9 +2,9 @@
 Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
-- Servo1: GPIO 5 (PWM channel 0)
-- Servo2: GPIO 6 (PWM channel 1)
-- LED: GPIO 7 (PWM via analogWrite)
+- Servo1: GPIO 5 (analogWrite PWM)
+- Servo2: GPIO 6 (analogWrite PWM)
+- LED: GPIO 7 (LEDC channel 0)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
 - PIR: GPIO 4 (digital input)
@@ -15,7 +15,6 @@ Date: April 2026
 */
 
 #include <Arduino.h>
-#include <ESP32Servo.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
@@ -41,6 +40,8 @@ const int LED_PIN    = 7;
 const int LEDC_CHANNEL = 0;
 const int LEDC_FREQ = 5000;
 const int LEDC_RES = 8;
+
+
 
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
@@ -134,7 +135,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "Core-ESP32-C3_MT_260410a";
+const char* FIRMWARE_VERSION = "CORE-ESP32-C3_MT_260410c";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -152,8 +153,6 @@ bool wifiEnabled = false;    // WiFi power saving flag
 
 // UART & Preferences
 HardwareSerial MeshSerial(1);
-Servo servo1;
-Servo servo2;
 bool otaInitialized = false;
 Preferences prefs;
 
@@ -177,9 +176,7 @@ void setup() {
   Serial.begin(115200);
   MeshSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  // Setup servos
-  servo1.setPeriodHertz(50); servo1.attach(SERVO1_PIN, 500, 2400);
-  servo2.setPeriodHertz(50); servo2.attach(SERVO2_PIN, 500, 2400);
+
 
   prefs.begin("device", false);
   deviceUID = prefs.getString("uid", "");
@@ -334,10 +331,13 @@ void setup() {
 
 void setServoAngle(int channel, int angle) {
   Serial.println("Setting servo " + String(channel) + " to angle " + String(angle));
+  int pwmValue = map(angle, 0, 180, 0, 255);
   if (channel == 0) {
-    servo1.write(angle);
+    analogWrite(SERVO1_PIN, pwmValue);
+    Serial.println("Servo1 analogWrite called");
   } else if (channel == 1) {
-    servo2.write(angle);
+    analogWrite(SERVO2_PIN, pwmValue);
+    Serial.println("Servo2 analogWrite called");
   }
 }
 
