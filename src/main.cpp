@@ -2,9 +2,9 @@
 Project name: SoleraMesh_C3_S1 - Meshtastic-integrated ESP32-C3 Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
-- Servo1: GPIO 5 (PWM channel 0)
-- Servo2: GPIO 6 (PWM channel 1)
-- LED: GPIO 7 (PWM via analogWrite)
+- Servo1: GPIO 5 (ESP32Servo library)
+- Servo2: GPIO 6 (ESP32Servo library)
+- LED: GPIO 7 (LEDC channel 2)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
 - PIR: GPIO 4 (digital input)
@@ -38,7 +38,7 @@ void readTime();
 const int SERVO1_PIN = 5;
 const int SERVO2_PIN = 6;
 const int LED_PIN    = 7;
-const int LEDC_CHANNEL = 0;
+const int LEDC_CHANNEL = 2;
 const int LEDC_FREQ = 5000;
 const int LEDC_RES = 8;
 
@@ -177,10 +177,6 @@ void setup() {
   Serial.begin(115200);
   MeshSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  // Setup servos
-  servo1.setPeriodHertz(50); servo1.attach(SERVO1_PIN, 500, 2400);
-  servo2.setPeriodHertz(50); servo2.attach(SERVO2_PIN, 500, 2400);
-
   prefs.begin("device", false);
   deviceUID = prefs.getString("uid", "");
   if (deviceUID == "") {
@@ -253,7 +249,13 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
 
-  // Setup LEDC for LED PWM
+  // Initialize servos first (should get LEDC channels 0,1)
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(90);
+  servo2.write(90);
+
+  // Setup LEDC for LED PWM (should get channel 2)
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
   ledcAttachPin(LED_PIN, LEDC_CHANNEL);
   ledcWrite(LEDC_CHANNEL, 0);
