@@ -2,9 +2,9 @@
 Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
-- Servo1: GPIO 5 (analogWrite PWM)
-- Servo2: GPIO 6 (analogWrite PWM)
-- LED: GPIO 7 (LEDC channel 0)
+- Servo1: GPIO 5 (ESP32Servo library)
+- Servo2: GPIO 6 (ESP32Servo library)
+- LED: GPIO 7 (LEDC channel 2)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
 - PIR: GPIO 4 (digital input)
@@ -20,6 +20,7 @@ Date: April 2026
 #include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <ESP32Servo.h>
 
 // Function prototypes
 void attemptWiFiConnect();
@@ -37,11 +38,12 @@ void readTime();
 const int SERVO1_PIN = 5;
 const int SERVO2_PIN = 6;
 const int LED_PIN    = 7;
-const int LEDC_CHANNEL = 0;
+const int LEDC_CHANNEL = 2;
 const int LEDC_FREQ = 5000;
 const int LEDC_RES = 8;
 
-
+Servo servo1;
+Servo servo2;
 
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
@@ -250,16 +252,19 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
 
-  // Setup LEDC for LED PWM
+  // Initialize servos first (should get LEDC channels 0,1)
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(90);
+  servo2.write(90);
+
+  // Setup LEDC for LED PWM (should get channel 2)
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
   ledcAttachPin(LED_PIN, LEDC_CHANNEL);
   ledcWrite(LEDC_CHANNEL, 0);
 
   analogWrite(MOTOR_AIN1, 0);
   analogWrite(MOTOR_AIN2, 0);
-
-  setServoAngle(0, 90);
-  setServoAngle(1, 90);
 
   // Initialize INA3221
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -331,13 +336,10 @@ void setup() {
 
 void setServoAngle(int channel, int angle) {
   Serial.println("Setting servo " + String(channel) + " to angle " + String(angle));
-  int pwmValue = map(angle, 0, 180, 0, 255);
   if (channel == 0) {
-    analogWrite(SERVO1_PIN, pwmValue);
-    Serial.println("Servo1 analogWrite called");
+    servo1.write(angle);
   } else if (channel == 1) {
-    analogWrite(SERVO2_PIN, pwmValue);
-    Serial.println("Servo2 analogWrite called");
+    servo2.write(angle);
   }
 }
 
