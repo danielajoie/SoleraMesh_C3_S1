@@ -2,7 +2,7 @@
 Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
-- Servo1: GPIO 5 (ESP32Servo library)
+- Servo1: GPIO 5 (ESP32Servo library) <center = Right; >center = Left
 - Servo2: GPIO 6 (ESP32Servo library)
 - LED: GPIO 7 (LEDC channel 2)
 - Motor AIN1: GPIO 0
@@ -137,7 +137,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "CORE-ESP32-C3_MT_260410c";
+const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-a";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -149,6 +149,14 @@ int currentMotorSpeed = 0;   // Track motor for status
 int currentLedPwm = 0;       // Track LED PWM for status
 int currentServo1Angle = 90; // Track servo angles
 int currentServo2Angle = 90;
+
+// Servo configuration variables
+int servo1Min = 0;           // Servo1 minimum angle
+int servo1Max = 180;         // Servo1 maximum angle
+int servo1Center = 90;       // Servo1 center/default position
+int servo2Min = 0;           // Servo2 minimum angle
+int servo2Max = 180;         // Servo2 maximum angle
+int servo2Center = 90;       // Servo2 center/default position
 unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 30000UL; // 30 seconds
 bool wifiEnabled = false;    // WiFi power saving flag
@@ -234,6 +242,16 @@ void setup() {
   batteryChemistry = (BatteryChemistry)prefs.getUChar("chemistry", BAT_LI_ION);
   chargeTempMin = prefs.getFloat("tempmin", 0.0);
   chargeTempMax = prefs.getFloat("tempmax", 45.0);
+  prefs.end();
+
+  // Load servo configuration settings
+  prefs.begin("servo", false);
+  servo1Min = prefs.getInt("s1min", 0);
+  servo1Max = prefs.getInt("s1max", 180);
+  servo1Center = prefs.getInt("s1center", 90);
+  servo2Min = prefs.getInt("s2min", 0);
+  servo2Max = prefs.getInt("s2max", 180);
+  servo2Center = prefs.getInt("s2center", 90);
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -606,6 +624,17 @@ void saveLoadPowerSettings() {
   prefs.end();
 }
 
+void saveServoSettings() {
+  prefs.begin("servo", false);
+  prefs.putInt("s1min", servo1Min);
+  prefs.putInt("s1max", servo1Max);
+  prefs.putInt("s1center", servo1Center);
+  prefs.putInt("s2min", servo2Min);
+  prefs.putInt("s2max", servo2Max);
+  prefs.putInt("s2center", servo2Center);
+  prefs.end();
+}
+
 void setupOTA() {
   ArduinoOTA.setHostname(deviceName.c_str());
   ArduinoOTA.setPassword(ota_password);
@@ -911,19 +940,91 @@ void loop() {
     cmd.trim();
 
     if (cmd.startsWith("servo1:")) {
-      int angle = cmd.substring(7).toInt();
-      if (angle >= 0 && angle <= 180) {
-        setServoAngle(0, angle);
-        currentServo1Angle = angle;
-        MeshSerial.printf("servo1 → %d\n", angle);
+      String subCmd = cmd.substring(7);
+      if (subCmd.startsWith("min:")) {
+        int newMin = subCmd.substring(4).toInt();
+        if (newMin >= 0 && newMin <= 180 && newMin < servo1Max) {
+          servo1Min = newMin;
+          if (servo1Center < servo1Min) servo1Center = servo1Min;
+          saveServoSettings();
+          MeshSerial.printf("servo1 min → %d\n", servo1Min);
+        } else {
+          MeshSerial.println("Invalid servo1 min (0-180, < max)");
+        }
+      } else if (subCmd.startsWith("max:")) {
+        int newMax = subCmd.substring(4).toInt();
+        if (newMax >= 0 && newMax <= 180 && newMax > servo1Min) {
+          servo1Max = newMax;
+          if (servo1Center > servo1Max) servo1Center = servo1Max;
+          saveServoSettings();
+          MeshSerial.printf("servo1 max → %d\n", servo1Max);
+        } else {
+          MeshSerial.println("Invalid servo1 max (0-180, > min)");
+        }
+      } else if (subCmd.startsWith("center:")) {
+        int newCenter = subCmd.substring(7).toInt();
+        if (newCenter >= servo1Min && newCenter <= servo1Max) {
+          servo1Center = newCenter;
+          saveServoSettings();
+          MeshSerial.printf("servo1 center → %d\n", servo1Center);
+        } else {
+          MeshSerial.printf("Invalid servo1 center (%d-%d)\n", servo1Min, servo1Max);
+        }
+      } else {
+        // Direct angle control with clamping
+        int angle = subCmd.toInt();
+        int clampedAngle = constrain(angle, servo1Min, servo1Max);
+        setServoAngle(0, clampedAngle);
+        currentServo1Angle = clampedAngle;
+        if (clampedAngle != angle) {
+          MeshSerial.printf("servo1 → %d*\n", clampedAngle);
+        } else {
+          MeshSerial.printf("servo1 → %d\n", clampedAngle);
+        }
       }
     }
     else if (cmd.startsWith("servo2:")) {
-      int angle = cmd.substring(7).toInt();
-      if (angle >= 0 && angle <= 180) {
-        setServoAngle(1, angle);
-        currentServo2Angle = angle;
-        MeshSerial.printf("servo2 → %d\n", angle);
+      String subCmd = cmd.substring(7);
+      if (subCmd.startsWith("min:")) {
+        int newMin = subCmd.substring(4).toInt();
+        if (newMin >= 0 && newMin <= 180 && newMin < servo2Max) {
+          servo2Min = newMin;
+          if (servo2Center < servo2Min) servo2Center = servo2Min;
+          saveServoSettings();
+          MeshSerial.printf("servo2 min → %d\n", servo2Min);
+        } else {
+          MeshSerial.println("Invalid servo2 min (0-180, < max)");
+        }
+      } else if (subCmd.startsWith("max:")) {
+        int newMax = subCmd.substring(4).toInt();
+        if (newMax >= 0 && newMax <= 180 && newMax > servo2Min) {
+          servo2Max = newMax;
+          if (servo2Center > servo2Max) servo2Center = servo2Max;
+          saveServoSettings();
+          MeshSerial.printf("servo2 max → %d\n", servo2Max);
+        } else {
+          MeshSerial.println("Invalid servo2 max (0-180, > min)");
+        }
+      } else if (subCmd.startsWith("center:")) {
+        int newCenter = subCmd.substring(7).toInt();
+        if (newCenter >= servo2Min && newCenter <= servo2Max) {
+          servo2Center = newCenter;
+          saveServoSettings();
+          MeshSerial.printf("servo2 center → %d\n", servo2Center);
+        } else {
+          MeshSerial.printf("Invalid servo2 center (%d-%d)\n", servo2Min, servo2Max);
+        }
+      } else {
+        // Direct angle control with clamping
+        int angle = subCmd.toInt();
+        int clampedAngle = constrain(angle, servo2Min, servo2Max);
+        setServoAngle(1, clampedAngle);
+        currentServo2Angle = clampedAngle;
+        if (clampedAngle != angle) {
+          MeshSerial.printf("servo2 → %d*\n", clampedAngle);
+        } else {
+          MeshSerial.printf("servo2 → %d\n", clampedAngle);
+        }
       }
     }
     else if (cmd.startsWith("light:")) {
@@ -1073,8 +1174,8 @@ void loop() {
     else if (cmd == "statusM") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("motor: %d\n", currentMotorSpeed);
-      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
-      MeshSerial.printf("servo2: %d\n", currentServo2Angle);
+      MeshSerial.printf("servo1: %d (%d-%d, center:%d)\n", currentServo1Angle, servo1Min, servo1Max, servo1Center);
+      MeshSerial.printf("servo2: %d (%d-%d, center:%d)\n", currentServo2Angle, servo2Min, servo2Max, servo2Center);
 
       String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
       MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
