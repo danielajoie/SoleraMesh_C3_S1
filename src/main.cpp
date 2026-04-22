@@ -2,13 +2,13 @@
 Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
-- Servo1: GPIO 5 (ESP32Servo library) <center = Right; >center = Left
-- Servo2: GPIO 6 (ESP32Servo library)
+- Servo1: GPIO 2 (ESP32Servo library) <center = Right; >center = Left
+- Servo2: GPIO 3 (ESP32Servo library)
 - LED: GPIO 7 (LEDC channel 2)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
 - PIR: GPIO 4 (digital input)
-- UART: GPIO 3 (RX) / GPIO 2 (TX) for Meshtastic
+- UART: GPIO 21 (RX) / GPIO 20 (TX) for Meshtastic
 - I2C: GPIO 8 (SDA) / GPIO 9 (SCL) for INA3221
 Libraries: WiFi, ArduinoOTA, Preferences, Wire
 Date: April 2026
@@ -138,7 +138,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-c";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-b";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -183,6 +183,12 @@ bool compassCalibrating = false;
 int compassCalMinX = 32767, compassCalMaxX = -32768;
 int compassCalMinY = 32767, compassCalMaxY = -32768;
 int compassCalMinZ = 32767, compassCalMaxZ = -32768;
+
+// Compass Navigation mode
+bool navigationMode = false;
+float targetHeading = 0.0;
+int navigationSteeringGain = 2;
+float navigationDeadband = 2.0;
 
 // Battery charging control
 enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
@@ -809,6 +815,42 @@ void loop() {
     }
 
     lastCompassRead = millis();
+  }
+
+  // Navigation steering control (runs every 100ms when active)
+  static unsigned long lastNavigationUpdate = 0;
+  if (millis() - lastNavigationUpdate >= 100 && navigationMode) {
+    // Check compass availability
+    if (!compassPresent) {
+      // Emergency stop - compass failed during navigation
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      navigationMode = false;
+      MeshSerial.println("NAVIGATION ERROR: Compass not available - motor stopped!");
+      Serial.println("Navigation emergency stop: compass unavailable");
+    } else {
+      // Calculate shortest angular error (handles 360° wrap-around)
+      float error = targetHeading - currentHeading;
+      if (error > 180.0) error -= 360.0;
+      if (error < -180.0) error += 360.0;
+
+      // Apply deadband
+      if (abs(error) < navigationDeadband) {
+        // Within deadband - steer straight
+        setServoAngle(0, servo1Center);
+        currentServo1Angle = servo1Center;
+      } else {
+        // Outside deadband - apply proportional steering
+        int steeringAngle = servo1Center + (error * navigationSteeringGain);
+        // Clamp to servo limits
+        steeringAngle = constrain(steeringAngle, servo1Min, servo1Max);
+        setServoAngle(0, steeringAngle);
+        currentServo1Angle = steeringAngle;
+      }
+    }
+
+    lastNavigationUpdate = millis();
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -1756,6 +1798,64 @@ void loop() {
         MeshSerial.printf("Ranges: X:%d Y:%d Z:%d\n", rangeX, rangeY, rangeZ);
       } else {
         MeshSerial.println("Calibration not in progress or compass not available");
+      }
+    }
+    // navigation:on - Enable navigation mode
+    else if (cmd == "navigation:on") {
+      if (compassPresent) {
+        navigationMode = true;
+        MeshSerial.println("Navigation mode → on");
+      } else {
+        MeshSerial.println("Navigation: compass not available");
+      }
+    }
+    // navigation:off - Disable navigation mode
+    else if (cmd == "navigation:off") {
+      navigationMode = false;
+      // Return servo to center when disabling navigation
+      setServoAngle(0, servo1Center);
+      currentServo1Angle = servo1Center;
+      MeshSerial.println("Navigation mode → off");
+    }
+    // navigation:heading:XXX - Set target heading (0-360°)
+    else if (cmd.startsWith("navigation:heading:")) {
+      float heading = cmd.substring(19).toFloat();
+      if (heading >= 0.0 && heading <= 360.0) {
+        targetHeading = heading;
+        MeshSerial.printf("Navigation heading → %.1f°\n", targetHeading);
+      } else {
+        MeshSerial.println("Invalid heading (0-360°)");
+      }
+    }
+    // navigation:status - Get navigation status and settings
+    else if (cmd == "navigation:status") {
+      MeshSerial.printf("navigation: %s\n", navigationMode ? "ON" : "OFF");
+      if (navigationMode) {
+        MeshSerial.printf("target: %.1f°\n", targetHeading);
+        MeshSerial.printf("current: %.1f°\n", currentHeading);
+        MeshSerial.printf("servo1: %d\n", currentServo1Angle);
+      }
+      MeshSerial.printf("gain: %d\n", navigationSteeringGain);
+      MeshSerial.printf("deadband: %.1f°\n", navigationDeadband);
+    }
+    // navigation:gain:X - Set steering gain (1-10)
+    else if (cmd.startsWith("navigation:gain:")) {
+      int gain = cmd.substring(16).toInt();
+      if (gain >= 1 && gain <= 10) {
+        navigationSteeringGain = gain;
+        MeshSerial.printf("Navigation gain → %d\n", navigationSteeringGain);
+      } else {
+        MeshSerial.println("Invalid gain (1-10)");
+      }
+    }
+    // navigation:deadband:X.X - Set deadband (0-10°)
+    else if (cmd.startsWith("navigation:deadband:")) {
+      float deadband = cmd.substring(20).toFloat();
+      if (deadband >= 0.0 && deadband <= 10.0) {
+        navigationDeadband = deadband;
+        MeshSerial.printf("Navigation deadband → %.1f°\n", navigationDeadband);
+      } else {
+        MeshSerial.println("Invalid deadband (0-10°)");
       }
     }
   }
