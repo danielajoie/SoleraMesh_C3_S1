@@ -20,6 +20,7 @@ Date: April 2026
 #include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <QMC5883LCompass.h>
 #include <ESP32Servo.h>
 
 // Function prototypes
@@ -173,6 +174,15 @@ Adafruit_AHTX0 aht30;
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
 bool aht30Present = false;
+
+// QMC5883L compass sensor
+QMC5883LCompass compass;
+float currentHeading = 0.0;
+bool compassPresent = false;
+bool compassCalibrating = false;
+int compassCalMinX = 32767, compassCalMaxX = -32768;
+int compassCalMinY = 32767, compassCalMaxY = -32768;
+int compassCalMinZ = 32767, compassCalMaxZ = -32768;
 
 // Battery charging control
 enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
@@ -356,6 +366,16 @@ void setup() {
   } else {
     Serial.println("AHT30 sensor not found");
   }
+
+  // Initialize QMC5883L compass sensor
+  compass.init();
+  compassPresent = true;
+  Serial.println("QMC5883L compass initialized");
+
+  // Initial reading
+  compass.read();
+  currentHeading = compass.getAzimuth();
+  Serial.printf("Compass Initial: %.1f°\n", currentHeading);
 }
 
 void setServoAngle(int channel, int angle) {
@@ -691,6 +711,7 @@ void loop() {
   static unsigned long lastINARead = 0;
   static unsigned long lastTimeRead = 0;
   static unsigned long lastAHTRead = 0;
+  static unsigned long lastCompassRead = 0;
 
   if (millis() - lastINARead >= 5000) {  // Read every 5 seconds
     readINA3221();
@@ -759,6 +780,31 @@ void loop() {
     }
 
     lastAHTRead = millis();
+  }
+
+  if (millis() - lastCompassRead >= 5000 && compassPresent) {  // Read every 5 seconds
+    compass.read();
+    currentHeading = compass.getAzimuth();
+
+    if (compassCalibrating) {
+      // Collect min/max values for calibration
+      int x = compass.getX();
+      int y = compass.getY();
+      int z = compass.getZ();
+      if (x < compassCalMinX) compassCalMinX = x;
+      if (x > compassCalMaxX) compassCalMaxX = x;
+      if (y < compassCalMinY) compassCalMinY = y;
+      if (y > compassCalMaxY) compassCalMaxY = y;
+      if (z < compassCalMinZ) compassCalMinZ = z;
+      if (z > compassCalMaxZ) compassCalMaxZ = z;
+      Serial.printf("Calibrating: X:%d Y:%d Z:%d (Min:%d,%d,%d Max:%d,%d,%d)\n",
+                   x, y, z, compassCalMinX, compassCalMinY, compassCalMinZ,
+                   compassCalMaxX, compassCalMaxY, compassCalMaxZ);
+    } else {
+      Serial.printf("Compass: %.1f° X:%d Y:%d Z:%d\n", currentHeading, compass.getX(), compass.getY(), compass.getZ());
+    }
+
+    lastCompassRead = millis();
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -1648,6 +1694,65 @@ void loop() {
       String chemName = (batteryChemistry == BAT_LI_ION) ? "Li-ion" : "Lead-acid";
       MeshSerial.printf("chemistry:%s temp:%.1f-%.1f°C\n",
                        chemName.c_str(), chargeTempMin, chargeTempMax);
+    }
+    // compass - Get current compass heading
+    else if (cmd == "compass") {
+      if (compassPresent) {
+        MeshSerial.printf("compass: %.1f°\n", currentHeading);
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:raw - Get raw X,Y,Z magnetic field values
+    else if (cmd == "compass:raw") {
+      if (compassPresent) {
+        compass.read();
+        MeshSerial.printf("compass raw: X:%d Y:%d Z:%d\n", compass.getX(), compass.getY(), compass.getZ());
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:calibrate - Start compass calibration process
+    else if (cmd == "compass:calibrate") {
+      if (compassPresent) {
+        compassCalibrating = true;
+        compassCalMinX = 32767; compassCalMaxX = -32768;
+        compassCalMinY = 32767; compassCalMaxY = -32768;
+        compassCalMinZ = 32767; compassCalMaxZ = -32768;
+        MeshSerial.println("Compass calibration started:");
+        MeshSerial.println("1. Rotate device 360° slowly in all axes");
+        MeshSerial.println("2. Send 'compass:calibrate:done' when finished");
+        MeshSerial.println("3. Calibration data will be collected and applied");
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:calibrate:done - Finish calibration and apply offsets
+    else if (cmd == "compass:calibrate:done") {
+      if (compassPresent && compassCalibrating) {
+        compassCalibrating = false;
+        // Calculate offsets (center of range)
+        int offsetX = (compassCalMaxX + compassCalMinX) / 2;
+        int offsetY = (compassCalMaxY + compassCalMinY) / 2;
+        int offsetZ = (compassCalMaxZ + compassCalMinZ) / 2;
+        // Calculate scales (assuming spherical calibration)
+        int rangeX = compassCalMaxX - compassCalMinX;
+        int rangeY = compassCalMaxY - compassCalMinY;
+        int rangeZ = compassCalMaxZ - compassCalMinZ;
+        float scaleX = 1000.0 / rangeX;
+        float scaleY = 1000.0 / rangeY;
+        float scaleZ = 1000.0 / rangeZ;
+
+        compass.setCalibrationOffsets(offsetX, offsetY, offsetZ);
+        compass.setCalibrationScales(scaleX, scaleY, scaleZ);
+
+        MeshSerial.printf("Calibration applied:\n");
+        MeshSerial.printf("Offsets: X:%d Y:%d Z:%d\n", offsetX, offsetY, offsetZ);
+        MeshSerial.printf("Scales: X:%.2f Y:%.2f Z:%.2f\n", scaleX, scaleY, scaleZ);
+        MeshSerial.printf("Ranges: X:%d Y:%d Z:%d\n", rangeX, rangeY, rangeZ);
+      } else {
+        MeshSerial.println("Calibration not in progress or compass not available");
+      }
     }
   }
 }
