@@ -35,8 +35,8 @@ void writeDS1307(uint8_t reg, uint8_t data);
 void readTime();
 
 // Hardware configuration
-const int SERVO1_PIN = 5;
-const int SERVO2_PIN = 6;
+const int SERVO1_PIN = 2;
+const int SERVO2_PIN = 3;
 const int LED_PIN    = 7;
 const int LEDC_CHANNEL = 2;
 const int LEDC_FREQ = 5000;
@@ -48,8 +48,8 @@ Servo servo2;
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
 
-const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX 21
-const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX 19
+const int UART_RX_PIN = 21;   // ESP32-C3 RX ← Meshtastic TX 21
+const int UART_TX_PIN = 20;   // ESP32-C3 TX → Meshtastic RX 19
 
 const int PIR_PIN = 4;       // PIR motion sensor
 const int RELAY_PIN = 10;    // Solar charging relay control
@@ -137,7 +137,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-b";
+const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-c";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -154,9 +154,11 @@ int currentServo2Angle = 90;
 int servo1Min = 0;           // Servo1 minimum angle
 int servo1Max = 180;         // Servo1 maximum angle
 int servo1Center = 90;       // Servo1 center/default position
+bool servo1Invert = false;   // Servo1 direction inversion
 int servo2Min = 0;           // Servo2 minimum angle
 int servo2Max = 180;         // Servo2 maximum angle
 int servo2Center = 90;       // Servo2 center/default position
+bool servo2Invert = false;   // Servo2 direction inversion
 unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 30000UL; // 30 seconds
 bool wifiEnabled = false;    // WiFi power saving flag
@@ -249,9 +251,11 @@ void setup() {
   servo1Min = prefs.getInt("s1min", 0);
   servo1Max = prefs.getInt("s1max", 180);
   servo1Center = prefs.getInt("s1center", 90);
+  servo1Invert = prefs.getBool("s1invert", false);
   servo2Min = prefs.getInt("s2min", 0);
   servo2Max = prefs.getInt("s2max", 180);
   servo2Center = prefs.getInt("s2center", 90);
+  servo2Invert = prefs.getBool("s2invert", false);
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -273,8 +277,10 @@ void setup() {
   // Initialize servos first (should get LEDC channels 0,1)
   servo1.attach(SERVO1_PIN);
   servo2.attach(SERVO2_PIN);
-  servo1.write(90);
-  servo2.write(90);
+  servo1.write(servo1Center);
+  servo2.write(servo2Center);
+  currentServo1Angle = servo1Center;
+  currentServo2Angle = servo2Center;
 
   // Setup LEDC for LED PWM (should get channel 2)
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
@@ -353,11 +359,19 @@ void setup() {
 }
 
 void setServoAngle(int channel, int angle) {
-  Serial.println("Setting servo " + String(channel) + " to angle " + String(angle));
+  // Apply direction inversion if enabled
+  int actualAngle = angle;
+  if (channel == 0 && servo1Invert) {
+    actualAngle = servo1Center - (angle - servo1Center);
+  } else if (channel == 1 && servo2Invert) {
+    actualAngle = servo2Center - (angle - servo2Center);
+  }
+
+  Serial.println("Setting servo " + String(channel) + " to angle " + String(angle) + " (actual: " + String(actualAngle) + ")");
   if (channel == 0) {
-    servo1.write(angle);
+    servo1.write(actualAngle);
   } else if (channel == 1) {
-    servo2.write(angle);
+    servo2.write(actualAngle);
   }
 }
 
@@ -629,9 +643,11 @@ void saveServoSettings() {
   prefs.putInt("s1min", servo1Min);
   prefs.putInt("s1max", servo1Max);
   prefs.putInt("s1center", servo1Center);
+  prefs.putBool("s1invert", servo1Invert);
   prefs.putInt("s2min", servo2Min);
   prefs.putInt("s2max", servo2Max);
   prefs.putInt("s2center", servo2Center);
+  prefs.putBool("s2invert", servo2Invert);
   prefs.end();
 }
 
@@ -970,6 +986,22 @@ void loop() {
         } else {
           MeshSerial.printf("Invalid servo1 center (%d-%d)\n", servo1Min, servo1Max);
         }
+      } else if (subCmd.startsWith("invert:")) {
+        String state = subCmd.substring(7);
+        state.toLowerCase();
+        if (state == "on" || state == "1") {
+          servo1Invert = true;
+          saveServoSettings();
+          MeshSerial.println("servo1 invert → on");
+        } else if (state == "off" || state == "0") {
+          servo1Invert = false;
+          saveServoSettings();
+          MeshSerial.println("servo1 invert → off");
+        } else {
+          MeshSerial.println("Use 'on' or 'off'");
+        }
+      } else if (subCmd == "invert") {
+        MeshSerial.printf("servo1 invert: %s\n", servo1Invert ? "on" : "off");
       } else if (subCmd == "center") {
         // Return servo to center position
         setServoAngle(0, servo1Center);
@@ -1019,6 +1051,22 @@ void loop() {
         } else {
           MeshSerial.printf("Invalid servo2 center (%d-%d)\n", servo2Min, servo2Max);
         }
+      } else if (subCmd.startsWith("invert:")) {
+        String state = subCmd.substring(7);
+        state.toLowerCase();
+        if (state == "on" || state == "1") {
+          servo2Invert = true;
+          saveServoSettings();
+          MeshSerial.println("servo2 invert → on");
+        } else if (state == "off" || state == "0") {
+          servo2Invert = false;
+          saveServoSettings();
+          MeshSerial.println("servo2 invert → off");
+        } else {
+          MeshSerial.println("Use 'on' or 'off'");
+        }
+      } else if (subCmd == "invert") {
+        MeshSerial.printf("servo2 invert: %s\n", servo2Invert ? "on" : "off");
       } else if (subCmd == "center") {
         // Return servo to center position
         setServoAngle(1, servo2Center);
@@ -1184,8 +1232,8 @@ void loop() {
     else if (cmd == "statusM") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("motor: %d\n", currentMotorSpeed);
-      MeshSerial.printf("servo1: %d (%d-%d, center:%d)\n", currentServo1Angle, servo1Min, servo1Max, servo1Center);
-      MeshSerial.printf("servo2: %d (%d-%d, center:%d)\n", currentServo2Angle, servo2Min, servo2Max, servo2Center);
+      MeshSerial.printf("servo1: %d (%d-%d, center:%d, invert:%s)\n", currentServo1Angle, servo1Min, servo1Max, servo1Center, servo1Invert ? "on" : "off");
+      MeshSerial.printf("servo2: %d (%d-%d, center:%d, invert:%s)\n", currentServo2Angle, servo2Min, servo2Max, servo2Center, servo2Invert ? "on" : "off");
 
       String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
       MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
