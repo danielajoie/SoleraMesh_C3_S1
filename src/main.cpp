@@ -137,7 +137,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-a";
+const char* FIRMWARE_VERSION = "MT_C3_260421_servoConfig-b";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -970,6 +970,11 @@ void loop() {
         } else {
           MeshSerial.printf("Invalid servo1 center (%d-%d)\n", servo1Min, servo1Max);
         }
+      } else if (subCmd == "center") {
+        // Return servo to center position
+        setServoAngle(0, servo1Center);
+        currentServo1Angle = servo1Center;
+        MeshSerial.printf("servo1 → center (%d)\n", servo1Center);
       } else {
         // Direct angle control with clamping
         int angle = subCmd.toInt();
@@ -1014,6 +1019,11 @@ void loop() {
         } else {
           MeshSerial.printf("Invalid servo2 center (%d-%d)\n", servo2Min, servo2Max);
         }
+      } else if (subCmd == "center") {
+        // Return servo to center position
+        setServoAngle(1, servo2Center);
+        currentServo2Angle = servo2Center;
+        MeshSerial.printf("servo2 → center (%d)\n", servo2Center);
       } else {
         // Direct angle control with clamping
         int angle = subCmd.toInt();
