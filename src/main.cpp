@@ -375,6 +375,8 @@ void setup() {
   // Initial reading
   compass.read();
   currentHeading = compass.getAzimuth();
+  // Normalize to 0-360° range
+  if (currentHeading < 0) currentHeading += 360.0;
   Serial.printf("Compass Initial: %.1f°\n", currentHeading);
 }
 
@@ -785,6 +787,8 @@ void loop() {
   if (millis() - lastCompassRead >= 5000 && compassPresent) {  // Read every 5 seconds
     compass.read();
     currentHeading = compass.getAzimuth();
+    // Normalize to 0-360° range
+    if (currentHeading < 0) currentHeading += 360.0;
 
     if (compassCalibrating) {
       // Collect min/max values for calibration
