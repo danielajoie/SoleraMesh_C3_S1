@@ -138,7 +138,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-b";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-d";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -183,12 +183,15 @@ bool compassCalibrating = false;
 int compassCalMinX = 32767, compassCalMaxX = -32768;
 int compassCalMinY = 32767, compassCalMaxY = -32768;
 int compassCalMinZ = 32767, compassCalMaxZ = -32768;
+unsigned long compassReadIntervalNav = 500;   // Fast refresh during navigation (ms)
+unsigned long compassReadIntervalIdle = 5000; // Slow refresh when idle (ms)
 
 // Compass Navigation mode
 bool navigationMode = false;
 float targetHeading = 0.0;
 int navigationSteeringGain = 2;
 float navigationDeadband = 2.0;
+unsigned long navigationUpdateInterval = 25; // milliseconds (default 25ms for fast response)
 
 // Battery charging control
 enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
@@ -790,7 +793,9 @@ void loop() {
     lastAHTRead = millis();
   }
 
-  if (millis() - lastCompassRead >= 5000 && compassPresent) {  // Read every 5 seconds
+  // Dynamic compass refresh rate based on navigation mode
+  unsigned long currentCompassInterval = navigationMode ? compassReadIntervalNav : compassReadIntervalIdle;
+  if (millis() - lastCompassRead >= currentCompassInterval && compassPresent) {
     compass.read();
     currentHeading = compass.getAzimuth();
     // Normalize to 0-360° range
@@ -817,9 +822,9 @@ void loop() {
     lastCompassRead = millis();
   }
 
-  // Navigation steering control (runs every 100ms when active)
+  // Navigation steering control (runs every navigationUpdateInterval ms when active)
   static unsigned long lastNavigationUpdate = 0;
-  if (millis() - lastNavigationUpdate >= 100 && navigationMode) {
+  if (millis() - lastNavigationUpdate >= navigationUpdateInterval && navigationMode) {
     // Check compass availability
     if (!compassPresent) {
       // Emergency stop - compass failed during navigation
@@ -1741,10 +1746,13 @@ void loop() {
       MeshSerial.printf("chemistry:%s temp:%.1f-%.1f°C\n",
                        chemName.c_str(), chargeTempMin, chargeTempMax);
     }
-    // compass - Get current compass heading
+    // compass - Get current compass heading and refresh mode
     else if (cmd == "compass") {
       if (compassPresent) {
-        MeshSerial.printf("compass: %.1f°\n", currentHeading);
+        String modeStr = navigationMode ? "nav" : "idle";
+        unsigned long currentInterval = navigationMode ? compassReadIntervalNav : compassReadIntervalIdle;
+        MeshSerial.printf("compass: %.1f° (%s mode, %lu ms interval)\n",
+                         currentHeading, modeStr.c_str(), currentInterval);
       } else {
         MeshSerial.println("compass: not available");
       }
@@ -1800,6 +1808,31 @@ void loop() {
         MeshSerial.println("Calibration not in progress or compass not available");
       }
     }
+    // compass:interval:nav:XXX - Set navigation mode refresh interval (100-2000ms)
+    else if (cmd.startsWith("compass:interval:nav:")) {
+      unsigned long interval = cmd.substring(21).toInt();
+      if (interval >= 100 && interval <= 2000) {
+        compassReadIntervalNav = interval;
+        MeshSerial.printf("Compass nav interval → %lu ms\n", compassReadIntervalNav);
+      } else {
+        MeshSerial.println("Invalid nav interval (100-2000 ms)");
+      }
+    }
+    // compass:interval:idle:XXX - Set idle mode refresh interval (1000-10000ms)
+    else if (cmd.startsWith("compass:interval:idle:")) {
+      unsigned long interval = cmd.substring(22).toInt();
+      if (interval >= 1000 && interval <= 10000) {
+        compassReadIntervalIdle = interval;
+        MeshSerial.printf("Compass idle interval → %lu ms\n", compassReadIntervalIdle);
+      } else {
+        MeshSerial.println("Invalid idle interval (1000-10000 ms)");
+      }
+    }
+    // compass:interval - Show current compass refresh intervals
+    else if (cmd == "compass:interval") {
+      MeshSerial.printf("compass intervals: nav=%lu ms, idle=%lu ms\n",
+                       compassReadIntervalNav, compassReadIntervalIdle);
+    }
     // navigation:on - Enable navigation mode
     else if (cmd == "navigation:on") {
       if (compassPresent) {
@@ -1837,6 +1870,7 @@ void loop() {
       }
       MeshSerial.printf("gain: %d\n", navigationSteeringGain);
       MeshSerial.printf("deadband: %.1f°\n", navigationDeadband);
+      MeshSerial.printf("interval: %lu ms\n", navigationUpdateInterval);
     }
     // navigation:gain:X - Set steering gain (1-10)
     else if (cmd.startsWith("navigation:gain:")) {
@@ -1856,6 +1890,16 @@ void loop() {
         MeshSerial.printf("Navigation deadband → %.1f°\n", navigationDeadband);
       } else {
         MeshSerial.println("Invalid deadband (0-10°)");
+      }
+    }
+    // navigation:interval:XX - Set update interval in milliseconds (10-200)
+    else if (cmd.startsWith("navigation:interval:")) {
+      unsigned long interval = cmd.substring(20).toInt();
+      if (interval >= 10 && interval <= 200) {
+        navigationUpdateInterval = interval;
+        MeshSerial.printf("Navigation interval → %lu ms\n", navigationUpdateInterval);
+      } else {
+        MeshSerial.println("Invalid interval (10-200 ms)");
       }
     }
   }
