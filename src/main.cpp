@@ -138,7 +138,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-d";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-e";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -846,8 +846,10 @@ void loop() {
         setServoAngle(0, servo1Center);
         currentServo1Angle = servo1Center;
       } else {
-        // Outside deadband - apply proportional steering
-        int steeringAngle = servo1Center + (error * navigationSteeringGain);
+        // Outside deadband - apply proportional steering with direction correction
+        // Invert steering when motor is in reverse (front-wheel steering vehicle)
+        int steeringDirection = (currentMotorSpeed >= 0) ? 1 : -1;
+        int steeringAngle = servo1Center + (error * navigationSteeringGain * steeringDirection);
         // Clamp to servo limits
         steeringAngle = constrain(steeringAngle, servo1Min, servo1Max);
         setServoAngle(0, steeringAngle);
@@ -1860,14 +1862,14 @@ void loop() {
         MeshSerial.println("Invalid heading (0-360°)");
       }
     }
-    // navigation:status - Get navigation status and settings
-    else if (cmd == "navigation:status") {
+    // statusN - Get navigation status and settings
+    else if (cmd == "statusN") {
       MeshSerial.printf("navigation: %s\n", navigationMode ? "ON" : "OFF");
-      if (navigationMode) {
-        MeshSerial.printf("target: %.1f°\n", targetHeading);
-        MeshSerial.printf("current: %.1f°\n", currentHeading);
-        MeshSerial.printf("servo1: %d\n", currentServo1Angle);
-      }
+      MeshSerial.printf("target: %.1f°\n", targetHeading);
+      MeshSerial.printf("current: %.1f°\n", currentHeading);
+      MeshSerial.printf("motor: %d (%s)\n", currentMotorSpeed,
+                       currentMotorSpeed >= 0 ? "forward" : "reverse");
+      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
       MeshSerial.printf("gain: %d\n", navigationSteeringGain);
       MeshSerial.printf("deadband: %.1f°\n", navigationDeadband);
       MeshSerial.printf("interval: %lu ms\n", navigationUpdateInterval);
