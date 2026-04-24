@@ -53,6 +53,7 @@ const int UART_RX_PIN = 21;   // ESP32-C3 RX ← Meshtastic TX 21
 const int UART_TX_PIN = 20;   // ESP32-C3 TX → Meshtastic RX 19
 
 const int PIR_PIN = 4;       // PIR motion sensor
+const int SHAFT_SENSOR_PIN = 5; // TCRT5000 shaft rotation sensor
 const int RELAY_PIN = 10;    // Solar charging relay control
 
 // INA3221 configuration
@@ -138,7 +139,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-e";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-rpm";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -202,6 +203,22 @@ bool chargingEnabled = false; // Current charging state
 enum ChargingStatus { CHG_DISABLED, CHG_ENABLED, CHG_ERROR_TEMP_LOW, CHG_ERROR_TEMP_HIGH, CHG_ERROR_SENSOR };
 ChargingStatus chargingStatus = CHG_DISABLED;
 unsigned long lastChargingStatusChange = 0;
+
+// Shaft rotation sensor (TCRT5000) - RPM and motion detection
+volatile unsigned long shaftPulseCount = 0;  // Interrupt counter for pulses
+unsigned long lastShaftPulseTime = 0;        // Timestamp of last pulse
+float currentRPM = 0.0;                      // Calculated RPM
+bool vehicleMoving = false;                  // Motion detection state
+unsigned long lastRPMCalculation = 0;        // When RPM was last calculated
+const unsigned long RPM_CALCULATION_INTERVAL = 1000; // Calculate RPM every second
+const unsigned long MOTION_TIMEOUT = 3000;   // Consider stopped if no pulses for 3 seconds
+int pulsesPerRevolution = 2;                 // Pulses per revolution (2 white lines)
+
+// Interrupt service routine for shaft sensor
+void IRAM_ATTR shaftSensorISR() {
+  shaftPulseCount++;
+  lastShaftPulseTime = millis();
+}
 
 void setup() {
   Serial.begin(115200);
@@ -277,6 +294,15 @@ void setup() {
   servo2Invert = prefs.getBool("s2invert", false);
   prefs.end();
 
+  // Load navigation and compass settings
+  prefs.begin("navigation", false);
+  compassReadIntervalNav = prefs.getULong("compass_nav", 500);
+  compassReadIntervalIdle = prefs.getULong("compass_idle", 5000);
+  navigationSteeringGain = prefs.getInt("gain", 2);
+  navigationDeadband = prefs.getFloat("deadband", 2.0);
+  navigationUpdateInterval = prefs.getULong("interval", 25);
+  prefs.end();
+
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
                     deviceUID.c_str(), deviceName.c_str(), groupName.c_str());
 
@@ -290,8 +316,12 @@ void setup() {
   pinMode(MOTOR_AIN1, OUTPUT);
   pinMode(MOTOR_AIN2, OUTPUT);
   pinMode(PIR_PIN, INPUT);
+  pinMode(SHAFT_SENSOR_PIN, INPUT);  // Shaft rotation sensor input
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
+
+  // Setup interrupt for shaft sensor (TCRT5000)
+  attachInterrupt(digitalPinToInterrupt(SHAFT_SENSOR_PIN), shaftSensorISR, RISING);
 
   // Initialize servos first (should get LEDC channels 0,1)
   servo1.attach(SERVO1_PIN);
@@ -1017,6 +1047,26 @@ void loop() {
     currentLedPwm = 0;
   }
 
+  // Shaft sensor RPM calculation and motion detection
+  if (millis() - lastRPMCalculation >= RPM_CALCULATION_INTERVAL) {
+    // Calculate RPM: pulses per second * 60 / pulses per revolution
+    // We have 1 pulse per revolution, so RPM = (pulses in last second) * 60
+    noInterrupts();
+    unsigned long pulseCount = shaftPulseCount;
+    shaftPulseCount = 0;  // Reset counter
+    interrupts();
+
+    // Calculate RPM: pulses per second * 60 / pulses per revolution
+    currentRPM = (pulseCount * 60.0) / (RPM_CALCULATION_INTERVAL / 1000.0) / pulsesPerRevolution;
+
+    // Motion detection: vehicle is moving if we got pulses recently
+    vehicleMoving = (millis() - lastShaftPulseTime) < MOTION_TIMEOUT;
+
+    Serial.printf("Shaft: %.1f RPM, %s\n", currentRPM, vehicleMoving ? "MOVING" : "STOPPED");
+
+    lastRPMCalculation = millis();
+  }
+
   // WiFi reconnection logic (only if WiFi is enabled)
   if (wifiEnabled && WiFi.status() != WL_CONNECTED && millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
     MeshSerial.println("WiFi disconnected, attempting reconnection...");
@@ -1327,7 +1377,7 @@ void loop() {
       MeshSerial.printf("battery: %.2fV %.1fmA %.3fW\n", inaBusV[1], inaCurrent[1]*1000, inaPower[1]);
       MeshSerial.printf("led_load: %.2fV %.1fmA %.3fW\n", inaBusV[2], inaCurrent[2]*1000, inaPower[2]);
     }
-    // statusM: motor status (name, motor, servo1, servo2, light)
+    // statusM: motor status (name, motor, servo1, servo2, light, rpm, motion)
     else if (cmd == "statusM") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("motor: %d\n", currentMotorSpeed);
@@ -1336,6 +1386,9 @@ void loop() {
 
       String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
       MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
+
+      MeshSerial.printf("rpm: %.1f\n", currentRPM);
+      MeshSerial.printf("motion: %s\n", vehicleMoving ? "MOVING" : "STOPPED");
     }
     // ina: detailed power readings
     else if (cmd == "ina") {
@@ -1815,6 +1868,9 @@ void loop() {
       unsigned long interval = cmd.substring(21).toInt();
       if (interval >= 100 && interval <= 2000) {
         compassReadIntervalNav = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("compass_nav", compassReadIntervalNav);
+        prefs.end();
         MeshSerial.printf("Compass nav interval → %lu ms\n", compassReadIntervalNav);
       } else {
         MeshSerial.println("Invalid nav interval (100-2000 ms)");
@@ -1825,6 +1881,9 @@ void loop() {
       unsigned long interval = cmd.substring(22).toInt();
       if (interval >= 1000 && interval <= 10000) {
         compassReadIntervalIdle = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("compass_idle", compassReadIntervalIdle);
+        prefs.end();
         MeshSerial.printf("Compass idle interval → %lu ms\n", compassReadIntervalIdle);
       } else {
         MeshSerial.println("Invalid idle interval (1000-10000 ms)");
@@ -1834,6 +1893,16 @@ void loop() {
     else if (cmd == "compass:interval") {
       MeshSerial.printf("compass intervals: nav=%lu ms, idle=%lu ms\n",
                        compassReadIntervalNav, compassReadIntervalIdle);
+    }
+    // shaft:pulses:X - Set pulses per revolution for RPM calculation (1-10)
+    else if (cmd.startsWith("shaft:pulses:")) {
+      int pulses = cmd.substring(13).toInt();
+      if (pulses >= 1 && pulses <= 10) {
+        pulsesPerRevolution = pulses;
+        MeshSerial.printf("Shaft pulses per revolution → %d\n", pulsesPerRevolution);
+      } else {
+        MeshSerial.println("Invalid pulses per revolution (1-10)");
+      }
     }
     // navigation:on - Enable navigation mode
     else if (cmd == "navigation:on") {
@@ -1879,6 +1948,9 @@ void loop() {
       int gain = cmd.substring(16).toInt();
       if (gain >= 1 && gain <= 10) {
         navigationSteeringGain = gain;
+        prefs.begin("navigation", false);
+        prefs.putInt("gain", navigationSteeringGain);
+        prefs.end();
         MeshSerial.printf("Navigation gain → %d\n", navigationSteeringGain);
       } else {
         MeshSerial.println("Invalid gain (1-10)");
@@ -1889,6 +1961,9 @@ void loop() {
       float deadband = cmd.substring(20).toFloat();
       if (deadband >= 0.0 && deadband <= 10.0) {
         navigationDeadband = deadband;
+        prefs.begin("navigation", false);
+        prefs.putFloat("deadband", navigationDeadband);
+        prefs.end();
         MeshSerial.printf("Navigation deadband → %.1f°\n", navigationDeadband);
       } else {
         MeshSerial.println("Invalid deadband (0-10°)");
@@ -1899,6 +1974,9 @@ void loop() {
       unsigned long interval = cmd.substring(20).toInt();
       if (interval >= 10 && interval <= 200) {
         navigationUpdateInterval = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("interval", navigationUpdateInterval);
+        prefs.end();
         MeshSerial.printf("Navigation interval → %lu ms\n", navigationUpdateInterval);
       } else {
         MeshSerial.println("Invalid interval (10-200 ms)");
