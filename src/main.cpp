@@ -139,7 +139,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_NavRD-e";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_NavRD-f";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -151,6 +151,12 @@ int currentMotorSpeed = 0;   // Track motor for status
 int currentLedPwm = 0;       // Track LED PWM for status
 int currentServo1Angle = 90; // Track servo angles
 int currentServo2Angle = 90;
+
+// Distance-based motor control variables
+bool distanceMotorActive = false;     // Flag when distance command is running
+int distanceMotorSpeed = 0;           // Speed for distance command
+float distanceMotorTarget = 0.0;      // Target distance in meters
+float distanceMotorStart = 0.0;       // Starting distance when command begins
 
 // Servo configuration variables
 int servo1Min = 0;           // Servo1 minimum angle
@@ -1089,6 +1095,22 @@ void loop() {
     lastRPMCalculation = millis();
   }
 
+  // Distance-based motor control monitoring
+  if (distanceMotorActive && pulsesPerMeter > 0.0) {
+    float distanceTraveled = currentDistance - distanceMotorStart;
+    if (distanceTraveled >= distanceMotorTarget) {
+      // Target distance reached - stop motor
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      distanceMotorActive = false;
+
+      MeshSerial.printf("motor stopped: %.1fm reached (target: %.1fm)\n",
+                       distanceTraveled, distanceMotorTarget);
+      Serial.printf("Distance motor stopped: %.1fm reached\n", distanceTraveled);
+    }
+  }
+
   // WiFi reconnection logic (only if WiFi is enabled)
   if (wifiEnabled && WiFi.status() != WL_CONNECTED && millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
     MeshSerial.println("WiFi disconnected, attempting reconnection...");
@@ -1268,20 +1290,68 @@ void loop() {
       }
     }
     else if (cmd.startsWith("motor:")) {
-      int speed = cmd.substring(6).toInt();
-      if (speed >= -255 && speed <= 255) {
-        if (speed > 0) {
-          analogWrite(MOTOR_AIN1, speed);
-          analogWrite(MOTOR_AIN2, 0);
-        } else if (speed < 0) {
-          analogWrite(MOTOR_AIN1, 0);
-          analogWrite(MOTOR_AIN2, -speed);
-        } else {
-          analogWrite(MOTOR_AIN1, 0);
-          analogWrite(MOTOR_AIN2, 0);
+      String motorParam = cmd.substring(6);
+      int dashIndex = motorParam.indexOf('-');
+
+      if (dashIndex > 0) {
+        // Distance-based command: motor:speed-distance
+        String speedStr = motorParam.substring(0, dashIndex);
+        String distanceStr = motorParam.substring(dashIndex + 1);
+
+        int speed = speedStr.toInt();
+        float distance = 0.0;
+
+        // Parse distance (must end with 'm' for meters)
+        if (distanceStr.endsWith("m")) {
+          distanceStr = distanceStr.substring(0, distanceStr.length() - 1);
+          distance = distanceStr.toFloat();
         }
-        currentMotorSpeed = speed;
-        MeshSerial.printf("motor → %d\n", speed);
+
+        // Validate parameters
+        if (speed >= -255 && speed <= 255 && distance > 0.0 && distance <= 1000.0 && pulsesPerMeter > 0.0) {
+          // Cancel any existing distance motor command
+          distanceMotorActive = false;
+
+          // Set up new distance command
+          distanceMotorSpeed = speed;
+          distanceMotorTarget = distance;
+          distanceMotorStart = currentDistance;
+          distanceMotorActive = true;
+
+          // Start motor
+          if (speed > 0) {
+            analogWrite(MOTOR_AIN1, speed);
+            analogWrite(MOTOR_AIN2, 0);
+          } else if (speed < 0) {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, -speed);
+          }
+          currentMotorSpeed = speed;
+
+          MeshSerial.printf("motor → %d for %.1fm (target: %.1fm)\n", speed, distance, distanceMotorStart + distance);
+        } else {
+          MeshSerial.println("Invalid distance command (speed -255-255, distance 0.1-1000.0m, must be calibrated)");
+        }
+      } else {
+        // Standard speed command: motor:speed
+        int speed = motorParam.toInt();
+        if (speed >= -255 && speed <= 255) {
+          // Cancel any distance motor command
+          distanceMotorActive = false;
+
+          if (speed > 0) {
+            analogWrite(MOTOR_AIN1, speed);
+            analogWrite(MOTOR_AIN2, 0);
+          } else if (speed < 0) {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, -speed);
+          } else {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, 0);
+          }
+          currentMotorSpeed = speed;
+          MeshSerial.printf("motor → %d\n", speed);
+        }
       }
     }
     else if (cmd.startsWith("wifi:")) {
