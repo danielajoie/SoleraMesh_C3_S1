@@ -139,7 +139,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_Nav-rpm";
+const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_NavRD-d";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -214,9 +214,19 @@ const unsigned long RPM_CALCULATION_INTERVAL = 1000; // Calculate RPM every seco
 const unsigned long MOTION_TIMEOUT = 3000;   // Consider stopped if no pulses for 3 seconds
 int pulsesPerRevolution = 2;                 // Pulses per revolution (2 white lines)
 
+// Distance measurement system
+volatile unsigned long totalDistancePulses = 0;     // Total pulses for distance calculation
+float pulsesPerMeter = 0.0;                  // Calibration factor: pulses per meter
+bool distanceCalibrating = false;            // Calibration in progress flag
+unsigned long calibrationStartTime = 0;      // When calibration drive started
+unsigned long calibrationPulsesStart = 0;    // Pulse count at calibration start
+float currentDistance = 0.0;                 // Current distance traveled (meters)
+unsigned long calibrationDriveTime = 3000;   // Calibration drive time in milliseconds (default 3 seconds)
+
 // Interrupt service routine for shaft sensor
 void IRAM_ATTR shaftSensorISR() {
   shaftPulseCount++;
+  totalDistancePulses++;
   lastShaftPulseTime = millis();
 }
 
@@ -301,6 +311,13 @@ void setup() {
   navigationSteeringGain = prefs.getInt("gain", 2);
   navigationDeadband = prefs.getFloat("deadband", 2.0);
   navigationUpdateInterval = prefs.getULong("interval", 25);
+  prefs.end();
+
+  // Load shaft/distance settings
+  prefs.begin("shaft", false);
+  pulsesPerRevolution = prefs.getInt("pulses_rev", 2);
+  pulsesPerMeter = prefs.getFloat("pulses_meter", 0.0);
+  calibrationDriveTime = prefs.getULong("cal_time", 3000);
   prefs.end();
 
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
@@ -1047,6 +1064,43 @@ void loop() {
     currentLedPwm = 0;
   }
 
+  // Distance calibration process (runs during calibration)
+  if (distanceCalibrating) {
+    unsigned long currentTime = millis();
+    unsigned long elapsed;
+
+    // Handle millis() overflow: if currentTime < calibrationStartTime, overflow occurred
+    if (currentTime >= calibrationStartTime) {
+      elapsed = currentTime - calibrationStartTime;
+    } else {
+      // Overflow occurred, calculate remaining time to overflow
+      elapsed = (0xFFFFFFFFUL - calibrationStartTime) + currentTime + 1;
+    }
+
+    // Rate-limit debug output to prevent serial flooding (every 500ms during calibration)
+    static unsigned long lastDebugTime = 0;
+    if (millis() - lastDebugTime >= 500) {
+      Serial.printf("DEBUG: Calibrating - elapsed=%lu/%lu ms\n", elapsed, calibrationDriveTime);
+      lastDebugTime = millis();
+    }
+
+    if (elapsed >= calibrationDriveTime) {
+      // Drive time elapsed - stop calibration drive
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+
+      noInterrupts();
+      unsigned long pulsesDuringTest = totalDistancePulses - calibrationPulsesStart;
+      interrupts();
+
+      Serial.printf("DEBUG: Calibration finished - pulsesDuringTest=%lu\n", pulsesDuringTest);
+      MeshSerial.printf("Calibration drive complete: %lu pulses in %lu ms\n", pulsesDuringTest, elapsed);
+      MeshSerial.println("Now measure actual distance traveled and send: distance:calibrate:set:X.X");
+      // Note: distanceCalibrating remains true until user sends set command
+    }
+  }
+
   // Shaft sensor RPM calculation and motion detection
   if (millis() - lastRPMCalculation >= RPM_CALCULATION_INTERVAL) {
     // Calculate RPM: pulses per second * 60 / pulses per revolution
@@ -1059,10 +1113,18 @@ void loop() {
     // Calculate RPM: pulses per second * 60 / pulses per revolution
     currentRPM = (pulseCount * 60.0) / (RPM_CALCULATION_INTERVAL / 1000.0) / pulsesPerRevolution;
 
+    // Calculate distance if calibrated: distance = total_pulses / pulses_per_meter
+    if (pulsesPerMeter > 0.0) {
+      noInterrupts();
+      unsigned long totalPulses = totalDistancePulses;
+      interrupts();
+      currentDistance = totalPulses / pulsesPerMeter;
+    }
+
     // Motion detection: vehicle is moving if we got pulses recently
     vehicleMoving = (millis() - lastShaftPulseTime) < MOTION_TIMEOUT;
 
-    Serial.printf("Shaft: %.1f RPM, %s\n", currentRPM, vehicleMoving ? "MOVING" : "STOPPED");
+    Serial.printf("Shaft: %.1f RPM, %.2fm, %s\n", currentRPM, currentDistance, vehicleMoving ? "MOVING" : "STOPPED");
 
     lastRPMCalculation = millis();
   }
@@ -1899,9 +1961,101 @@ void loop() {
       int pulses = cmd.substring(13).toInt();
       if (pulses >= 1 && pulses <= 10) {
         pulsesPerRevolution = pulses;
+        prefs.begin("shaft", false);
+        prefs.putInt("pulses_rev", pulsesPerRevolution);
+        prefs.end();
         MeshSerial.printf("Shaft pulses per revolution → %d\n", pulsesPerRevolution);
       } else {
         MeshSerial.println("Invalid pulses per revolution (1-10)");
+      }
+    }
+    // distance - Get current distance traveled
+    else if (cmd == "distance") {
+      if (pulsesPerMeter > 0.0) {
+        MeshSerial.printf("distance: %.2f meters\n", currentDistance);
+      } else {
+        MeshSerial.println("distance: not calibrated");
+      }
+    }
+    // distance:reset - Reset distance counter to zero
+    else if (cmd == "distance:reset") {
+      noInterrupts();
+      totalDistancePulses = 0;
+      interrupts();
+      currentDistance = 0.0;
+      MeshSerial.println("distance counter → reset");
+    }
+    // distance:calibrate:start - Start distance calibration (3-second drive)
+    else if (cmd == "distance:calibrate:start") {
+      if (vehicleMoving) {
+        MeshSerial.println("distance calibration: vehicle must be stopped first");
+      } else {
+        distanceCalibrating = true;
+        calibrationStartTime = millis();
+        calibrationPulsesStart = totalDistancePulses;
+        // Start driving straight at full speed
+        setServoAngle(0, servo1Center);
+        currentServo1Angle = servo1Center;
+        analogWrite(MOTOR_AIN1, 255);
+        analogWrite(MOTOR_AIN2, 0);
+        currentMotorSpeed = 255;
+        Serial.printf("DEBUG: Calibration started - calibrationStartTime=%lu, calibrationDriveTime=%lu\n",
+                     calibrationStartTime, calibrationDriveTime);
+        MeshSerial.println("distance calibration: started");
+        MeshSerial.println("Drive straight for 3 seconds, then send distance:calibrate:set:X.X");
+      }
+    }
+    // distance:calibrate:set:X.X - Set actual distance traveled in meters
+    else if (cmd.startsWith("distance:calibrate:set:")) {
+      if (!distanceCalibrating) {
+        MeshSerial.println("distance calibration: not in progress");
+      } else {
+        float actualDistance = cmd.substring(23).toFloat();
+        if (actualDistance > 0.0 && actualDistance <= 50.0) {  // Reasonable range check
+          noInterrupts();
+          unsigned long pulsesDuringTest = totalDistancePulses - calibrationPulsesStart;
+          interrupts();
+
+          pulsesPerMeter = pulsesDuringTest / actualDistance;
+
+          // Save calibration
+          prefs.begin("shaft", false);
+          prefs.putFloat("pulses_meter", pulsesPerMeter);
+          prefs.end();
+
+          distanceCalibrating = false;
+          // Stop motor
+          analogWrite(MOTOR_AIN1, 0);
+          analogWrite(MOTOR_AIN2, 0);
+          currentMotorSpeed = 0;
+
+          MeshSerial.printf("distance calibration: %.0f pulses / %.2f meters = %.1f pulses/meter\n",
+                           pulsesDuringTest, actualDistance, pulsesPerMeter);
+          MeshSerial.println("Calibration saved - distance measurement now active");
+        } else {
+          MeshSerial.println("Invalid distance (0.1-50.0 meters)");
+        }
+      }
+    }
+    // distance:cal - Show current calibration factor
+    else if (cmd == "distance:cal") {
+      if (pulsesPerMeter > 0.0) {
+        MeshSerial.printf("distance calibration: %.1f pulses per meter\n", pulsesPerMeter);
+      } else {
+        MeshSerial.println("distance calibration: not set");
+      }
+    }
+    // distance:caltime:X - Set calibration drive time in milliseconds (1000-10000)
+    else if (cmd.startsWith("distance:caltime:")) {
+      unsigned long calTime = cmd.substring(17).toInt();
+      if (calTime >= 1000 && calTime <= 10000) {
+        calibrationDriveTime = calTime;
+        prefs.begin("shaft", false);
+        prefs.putULong("cal_time", calibrationDriveTime);
+        prefs.end();
+        MeshSerial.printf("Calibration drive time → %lu ms\n", calibrationDriveTime);
+      } else {
+        MeshSerial.println("Invalid calibration time (1000-10000 ms)");
       }
     }
     // navigation:on - Enable navigation mode
