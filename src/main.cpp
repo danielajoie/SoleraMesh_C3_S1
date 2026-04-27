@@ -139,7 +139,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "MT_C3_260421_Compass_NavRD-f";
+const char* FIRMWARE_VERSION = "MT_C3_260426_NavHRD-c";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -199,6 +199,22 @@ float targetHeading = 0.0;
 int navigationSteeringGain = 2;
 float navigationDeadband = 2.0;
 unsigned long navigationUpdateInterval = 25; // milliseconds (default 25ms for fast response)
+
+// Navigation Sequence mode
+enum NavSeqMode { NAV_STOP, NAV_LOOP, NAV_SINGLE_RUN };
+NavSeqMode seqMode = NAV_STOP;
+
+// Navigation Sequence data
+struct NavSegment {
+  int16_t speed;
+  float dist;
+  float heading;
+};
+NavSegment navSegments[8] = {0};
+uint8_t navCurrentSegment = 0;
+bool navSequenceActive = false;
+float navSegStartDist = 0.0;
+bool navSequencePaused = false;
 
 // Battery charging control
 enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
@@ -315,6 +331,16 @@ void setup() {
   navigationUpdateInterval = prefs.getULong("interval", 25);
   prefs.end();
 
+  // Load navigation sequence settings
+  prefs.begin("navseq", false);
+  seqMode = (NavSeqMode)prefs.getUChar("mode", NAV_STOP);
+  for (uint8_t i = 0; i < 8; i++) {
+    navSegments[i].speed = prefs.getShort(("seg" + String(i+1) + "_speed").c_str(), 0);
+    navSegments[i].dist = prefs.getFloat(("seg" + String(i+1) + "_dist").c_str(), 0.0);
+    navSegments[i].heading = prefs.getFloat(("seg" + String(i+1) + "_head").c_str(), 0.0);
+  }
+  prefs.end();
+
   // Load shaft/distance settings
   prefs.begin("shaft", false);
   pulsesPerRevolution = prefs.getInt("pulses_rev", 2);
@@ -336,6 +362,7 @@ void setup() {
   pinMode(PIR_PIN, INPUT);
   pinMode(SHAFT_SENSOR_PIN, INPUT);  // Shaft rotation sensor input
   pinMode(RELAY_PIN, OUTPUT);
+  pinMode(6, INPUT_PULLUP);  // Pause/resume button
   digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
 
   // Setup interrupt for shaft sensor (TCRT5000)
@@ -730,6 +757,17 @@ void saveServoSettings() {
   prefs.end();
 }
 
+void saveNavSeqSettings() {
+  prefs.begin("navseq", false);
+  prefs.putUChar("mode", seqMode);
+  for (uint8_t i = 0; i < 8; i++) {
+    prefs.putShort(("seg" + String(i+1) + "_speed").c_str(), navSegments[i].speed);
+    prefs.putFloat(("seg" + String(i+1) + "_dist").c_str(), navSegments[i].dist);
+    prefs.putFloat(("seg" + String(i+1) + "_head").c_str(), navSegments[i].heading);
+  }
+  prefs.end();
+}
+
 void setupOTA() {
   ArduinoOTA.setHostname(deviceName.c_str());
   ArduinoOTA.setPassword(ota_password);
@@ -906,6 +944,71 @@ void loop() {
     }
 
     lastNavigationUpdate = millis();
+  }
+
+  // Navigation sequence logic
+  if (navSequenceActive && !navSequencePaused) {
+    // Set motor speed for current segment
+    int speed = navSegments[navCurrentSegment].speed;
+    if (speed > 0) {
+      analogWrite(MOTOR_AIN1, speed);
+      analogWrite(MOTOR_AIN2, 0);
+    } else if (speed < 0) {
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, -speed);
+    } else {
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+    }
+    currentMotorSpeed = speed;
+
+    // Set target heading
+    targetHeading = navSegments[navCurrentSegment].heading;
+    navigationMode = true;  // Enable navigation for heading hold
+
+    // Check distance
+    if (pulsesPerMeter > 0.0) {
+      float traveled = currentDistance - navSegStartDist;
+      if (traveled >= navSegments[navCurrentSegment].dist) {
+        navCurrentSegment++;
+        if (navCurrentSegment >= 8 || navSegments[navCurrentSegment].dist == 0.0) {
+          // End of sequence
+          if (seqMode == NAV_LOOP) {
+            navCurrentSegment = 0;
+            navSegStartDist = currentDistance;
+            MeshSerial.println("navseq: looped back to segment 1");
+          } else {
+            navSequenceActive = false;
+            navigationMode = false;
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, 0);
+            currentMotorSpeed = 0;
+            setServoAngle(0, servo1Center);
+            currentServo1Angle = servo1Center;
+            MeshSerial.println("navseq: sequence complete");
+          }
+        } else {
+          // Next segment
+          navSegStartDist = currentDistance;
+          MeshSerial.printf("navseq: advanced to segment %d\n", navCurrentSegment + 1);
+        }
+      }
+    }
+  } else if (navSequenceActive && navSequencePaused) {
+    // Paused: stop motor, center servo
+    analogWrite(MOTOR_AIN1, 0);
+    analogWrite(MOTOR_AIN2, 0);
+    currentMotorSpeed = 0;
+    setServoAngle(0, servo1Center);
+    currentServo1Angle = servo1Center;
+  }
+
+  // Button for pause/resume
+  static unsigned long lastBtnPress = 0;
+  if (digitalRead(6) == LOW && millis() - lastBtnPress > 500) {
+    navSequencePaused = !navSequencePaused;
+    lastBtnPress = millis();
+    MeshSerial.printf("navseq: %s (button)\n", navSequencePaused ? "paused" : "resumed");
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -2105,6 +2208,110 @@ void loop() {
         MeshSerial.printf("Navigation interval → %lu ms\n", navigationUpdateInterval);
       } else {
         MeshSerial.println("Invalid interval (10-200 ms)");
+      }
+    }
+    // navsegN:speed-dist-head - Set navigation segment N (1-8)
+    else if (cmd.startsWith("navseg")) {
+      int segNum = cmd.substring(6,7).toInt() - 1;
+      if (segNum >= 0 && segNum < 8) {
+        String params = cmd.substring(8);
+        int dash1 = params.indexOf('-');
+        int dash2 = params.indexOf('-', dash1+1);
+        if (dash1 > 0 && dash2 > dash1) {
+          int speed = params.substring(0, dash1).toInt();
+          float dist = params.substring(dash1+1, dash2).toFloat();
+          float head = params.substring(dash2+1).toFloat();
+          if (speed >= -255 && speed <= 255 && dist > 0.0 && dist <= 1000.0 && head >= 0.0 && head <= 360.0) {
+            navSegments[segNum].speed = speed;
+            navSegments[segNum].dist = dist;
+            navSegments[segNum].heading = head;
+            saveNavSeqSettings();
+            MeshSerial.printf("navseg%d → speed:%d dist:%.1fm head:%.1f°\n", segNum+1, speed, dist, head);
+          } else {
+            MeshSerial.println("Invalid navseg params");
+          }
+        } else {
+          MeshSerial.println("Invalid navseg format (navsegN:speed-dist-head)");
+        }
+      } else {
+        MeshSerial.println("Invalid segment number (1-8)");
+      }
+    }
+    // navseq:start - Start navigation sequence
+    else if (cmd == "navseq:start") {
+      if (compassPresent && pulsesPerMeter > 0.0) {
+        navSequenceActive = true;
+        navSequencePaused = false;
+        navCurrentSegment = 0;
+        navSegStartDist = currentDistance;
+        navigationMode = true;
+        MeshSerial.println("navseq: started");
+      } else {
+        MeshSerial.println("navseq: compass or distance not calibrated");
+      }
+    }
+    // navseq:stop - Stop navigation sequence
+    else if (cmd == "navseq:stop") {
+      navSequenceActive = false;
+      navSequencePaused = false;
+      navigationMode = false;
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      setServoAngle(0, servo1Center);
+      currentServo1Angle = servo1Center;
+      MeshSerial.println("navseq: stopped");
+    }
+    // navseq:pause - Pause navigation sequence
+    else if (cmd == "navseq:pause") {
+      if (navSequenceActive) {
+        navSequencePaused = true;
+        MeshSerial.println("navseq: paused");
+      }
+    }
+    // navseq:resume - Resume navigation sequence
+    else if (cmd == "navseq:resume") {
+      if (navSequenceActive) {
+        navSequencePaused = false;
+        MeshSerial.println("navseq: resumed");
+      }
+    }
+    // navseq:mode:stop|loop|run - Set end-of-sequence mode
+    else if (cmd.startsWith("navseq:mode:")) {
+      String modeStr = cmd.substring(12);
+      if (modeStr == "stop") seqMode = NAV_STOP;
+      else if (modeStr == "loop") seqMode = NAV_LOOP;
+      else if (modeStr == "run") seqMode = NAV_SINGLE_RUN;
+      else {
+        MeshSerial.println("Invalid mode (stop/loop/run)");
+        return;
+      }
+      saveNavSeqSettings();
+      MeshSerial.printf("navseq mode → %s\n", modeStr.c_str());
+    }
+    // navseq:clear - Clear all navigation segments
+    else if (cmd == "navseq:clear") {
+      for (uint8_t i = 0; i < 8; i++) {
+        navSegments[i] = {0, 0.0, 0.0};
+      }
+      saveNavSeqSettings();
+      MeshSerial.println("navseq: cleared");
+    }
+    // statusNS - Navigation sequence status
+    else if (cmd == "statusNS") {
+      MeshSerial.printf("navseq: %s\n", navSequenceActive ? "ON" : "OFF");
+      if (navSequenceActive) {
+        MeshSerial.printf("paused: %s\n", navSequencePaused ? "YES" : "NO");
+        MeshSerial.printf("segment: %d/8\n", navCurrentSegment + 1);
+        MeshSerial.printf("mode: %s\n", seqMode == NAV_STOP ? "STOP" : seqMode == NAV_LOOP ? "LOOP" : "RUN");
+        if (pulsesPerMeter > 0.0) {
+          float traveled = currentDistance - navSegStartDist;
+          float rem = navSegments[navCurrentSegment].dist - traveled;
+          MeshSerial.printf("remaining: %.2fm\n", rem > 0 ? rem : 0);
+        }
+        MeshSerial.printf("target head: %.1f°\n", navSegments[navCurrentSegment].heading);
+        MeshSerial.printf("current head: %.1f°\n", currentHeading);
+        MeshSerial.printf("motor: %d\n", navSegments[navCurrentSegment].speed);
       }
     }
   }
