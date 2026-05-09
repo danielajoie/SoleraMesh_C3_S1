@@ -134,7 +134,7 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
-const char* FIRMWARE_VERSION = "SoleraMesh_STimeRTC";
+const char* FIRMWARE_VERSION = "SoleraMesh_STimeRTC-Sfix";
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
