@@ -1,26 +1,32 @@
 /*
-Project name: SoleraMesh_C3_S1 - Meshtastic-integrated ESP32-C3 Controller
+Project name: MeshTruck_C3_S1 - Meshtastic-integrated ESP32-C3 RC vehicle Controller
 Board: seeed_xiao_esp32c3
 Hardware/pins:
+<<<<<<< HEAD
 - Servo1: GPIO 5 (ESP32Servo library)
 - Servo2: GPIO 6 (ESP32Servo library)
+=======
+- Servo1: GPIO 2 (ESP32Servo library) <center = Right; >center = Left
+- Servo2: GPIO 3 (ESP32Servo library)
+>>>>>>> e68c68c72523cbbc9fe0c0d109697f5a6b915b44
 - LED: GPIO 7 (LEDC channel 2)
 - Motor AIN1: GPIO 0
 - Motor AIN2: GPIO 1
 - PIR: GPIO 4 (digital input)
-- UART: GPIO 3 (RX) / GPIO 2 (TX) for Meshtastic
+- UART: GPIO 21 (RX) / GPIO 20 (TX) for Meshtastic
 - I2C: GPIO 8 (SDA) / GPIO 9 (SCL) for INA3221
 Libraries: WiFi, ArduinoOTA, Preferences, Wire
-Date: March 2026
+Date: April 2026
 */
 
 #include <Arduino.h>
-#include <ESP32Servo.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <QMC5883LCompass.h>
+#include <ESP32Servo.h>
 
 // Function prototypes
 void attemptWiFiConnect();
@@ -35,20 +41,24 @@ void writeDS1307(uint8_t reg, uint8_t data);
 void readTime();
 
 // Hardware configuration
-const int SERVO1_PIN = 5;
-const int SERVO2_PIN = 6;
+const int SERVO1_PIN = 2;
+const int SERVO2_PIN = 3;
 const int LED_PIN    = 7;
 const int LEDC_CHANNEL = 2;
 const int LEDC_FREQ = 5000;
 const int LEDC_RES = 8;
 
+Servo servo1;
+Servo servo2;
+
 const int MOTOR_AIN1 = 0;
 const int MOTOR_AIN2 = 1;
 
-const int UART_RX_PIN = 3;   // ESP32-C3 RX ← Meshtastic TX
-const int UART_TX_PIN = 2;   // ESP32-C3 TX → Meshtastic RX
+const int UART_RX_PIN = 21;   // ESP32-C3 RX ← Meshtastic TX 21
+const int UART_TX_PIN = 20;   // ESP32-C3 TX → Meshtastic RX 19
 
 const int PIR_PIN = 4;       // PIR motion sensor
+const int SHAFT_SENSOR_PIN = 5; // TCRT5000 shaft rotation sensor
 const int RELAY_PIN = 10;    // Solar charging relay control
 
 // INA3221 configuration
@@ -134,7 +144,11 @@ const char* DEFAULT_PASSWORD = "YourWiFiPassword";
 const char* ota_password     = "ota_pass";
 
 // Firmware version (hardcoded at compile time)
+<<<<<<< HEAD
 const char* FIRMWARE_VERSION = "SoleraMesh_STimeRTC-Sfix";
+=======
+const char* FIRMWARE_VERSION = "MT_C3_260426_NavHRD-c";
+>>>>>>> e68c68c72523cbbc9fe0c0d109697f5a6b915b44
 
 // Runtime variables
 String deviceUID;            // Unique fixed UID
@@ -146,14 +160,28 @@ int currentMotorSpeed = 0;   // Track motor for status
 int currentLedPwm = 0;       // Track LED PWM for status
 int currentServo1Angle = 90; // Track servo angles
 int currentServo2Angle = 90;
+
+// Distance-based motor control variables
+bool distanceMotorActive = false;     // Flag when distance command is running
+int distanceMotorSpeed = 0;           // Speed for distance command
+float distanceMotorTarget = 0.0;      // Target distance in meters
+float distanceMotorStart = 0.0;       // Starting distance when command begins
+
+// Servo configuration variables
+int servo1Min = 0;           // Servo1 minimum angle
+int servo1Max = 180;         // Servo1 maximum angle
+int servo1Center = 90;       // Servo1 center/default position
+bool servo1Invert = false;   // Servo1 direction inversion
+int servo2Min = 0;           // Servo2 minimum angle
+int servo2Max = 180;         // Servo2 maximum angle
+int servo2Center = 90;       // Servo2 center/default position
+bool servo2Invert = false;   // Servo2 direction inversion
 unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 30000UL; // 30 seconds
 bool wifiEnabled = false;    // WiFi power saving flag
 
 // UART & Preferences
 HardwareSerial MeshSerial(1);
-Servo servo1;
-Servo servo2;
 bool otaInitialized = false;
 Preferences prefs;
 
@@ -162,6 +190,40 @@ Adafruit_AHTX0 aht30;
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
 bool aht30Present = false;
+
+// QMC5883L compass sensor
+QMC5883LCompass compass;
+float currentHeading = 0.0;
+bool compassPresent = false;
+bool compassCalibrating = false;
+int compassCalMinX = 32767, compassCalMaxX = -32768;
+int compassCalMinY = 32767, compassCalMaxY = -32768;
+int compassCalMinZ = 32767, compassCalMaxZ = -32768;
+unsigned long compassReadIntervalNav = 500;   // Fast refresh during navigation (ms)
+unsigned long compassReadIntervalIdle = 5000; // Slow refresh when idle (ms)
+
+// Compass Navigation mode
+bool navigationMode = false;
+float targetHeading = 0.0;
+int navigationSteeringGain = 2;
+float navigationDeadband = 2.0;
+unsigned long navigationUpdateInterval = 25; // milliseconds (default 25ms for fast response)
+
+// Navigation Sequence mode
+enum NavSeqMode { NAV_STOP, NAV_LOOP, NAV_SINGLE_RUN };
+NavSeqMode seqMode = NAV_STOP;
+
+// Navigation Sequence data
+struct NavSegment {
+  int16_t speed;
+  float dist;
+  float heading;
+};
+NavSegment navSegments[8] = {0};
+uint8_t navCurrentSegment = 0;
+bool navSequenceActive = false;
+float navSegStartDist = 0.0;
+bool navSequencePaused = false;
 
 // Battery charging control
 enum BatteryChemistry { BAT_LI_ION, BAT_LEAD_ACID };
@@ -173,10 +235,37 @@ enum ChargingStatus { CHG_DISABLED, CHG_ENABLED, CHG_ERROR_TEMP_LOW, CHG_ERROR_T
 ChargingStatus chargingStatus = CHG_DISABLED;
 unsigned long lastChargingStatusChange = 0;
 
+// Shaft rotation sensor (TCRT5000) - RPM and motion detection
+volatile unsigned long shaftPulseCount = 0;  // Interrupt counter for pulses
+unsigned long lastShaftPulseTime = 0;        // Timestamp of last pulse
+float currentRPM = 0.0;                      // Calculated RPM
+bool vehicleMoving = false;                  // Motion detection state
+unsigned long lastRPMCalculation = 0;        // When RPM was last calculated
+const unsigned long RPM_CALCULATION_INTERVAL = 1000; // Calculate RPM every second
+const unsigned long MOTION_TIMEOUT = 3000;   // Consider stopped if no pulses for 3 seconds
+int pulsesPerRevolution = 2;                 // Pulses per revolution (2 white lines)
+
+// Distance measurement system
+volatile unsigned long totalDistancePulses = 0;     // Total pulses for distance calculation
+float pulsesPerMeter = 0.0;                  // Calibration factor: pulses per meter
+float currentDistance = 0.0;                 // Current distance traveled (meters)
+
+// Interrupt service routine for shaft sensor
+void IRAM_ATTR shaftSensorISR() {
+  shaftPulseCount++;
+  totalDistancePulses++;
+  lastShaftPulseTime = millis();
+}
+
 void setup() {
   Serial.begin(115200);
   MeshSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> e68c68c72523cbbc9fe0c0d109697f5a6b915b44
   prefs.begin("device", false);
   deviceUID = prefs.getString("uid", "");
   if (deviceUID == "") {
@@ -233,6 +322,43 @@ void setup() {
   chargeTempMax = prefs.getFloat("tempmax", 45.0);
   prefs.end();
 
+  // Load servo configuration settings
+  prefs.begin("servo", false);
+  servo1Min = prefs.getInt("s1min", 0);
+  servo1Max = prefs.getInt("s1max", 180);
+  servo1Center = prefs.getInt("s1center", 90);
+  servo1Invert = prefs.getBool("s1invert", false);
+  servo2Min = prefs.getInt("s2min", 0);
+  servo2Max = prefs.getInt("s2max", 180);
+  servo2Center = prefs.getInt("s2center", 90);
+  servo2Invert = prefs.getBool("s2invert", false);
+  prefs.end();
+
+  // Load navigation and compass settings
+  prefs.begin("navigation", false);
+  compassReadIntervalNav = prefs.getULong("compass_nav", 500);
+  compassReadIntervalIdle = prefs.getULong("compass_idle", 5000);
+  navigationSteeringGain = prefs.getInt("gain", 2);
+  navigationDeadband = prefs.getFloat("deadband", 2.0);
+  navigationUpdateInterval = prefs.getULong("interval", 25);
+  prefs.end();
+
+  // Load navigation sequence settings
+  prefs.begin("navseq", false);
+  seqMode = (NavSeqMode)prefs.getUChar("mode", NAV_STOP);
+  for (uint8_t i = 0; i < 8; i++) {
+    navSegments[i].speed = prefs.getShort(("seg" + String(i+1) + "_speed").c_str(), 0);
+    navSegments[i].dist = prefs.getFloat(("seg" + String(i+1) + "_dist").c_str(), 0.0);
+    navSegments[i].heading = prefs.getFloat(("seg" + String(i+1) + "_head").c_str(), 0.0);
+  }
+  prefs.end();
+
+  // Load shaft/distance settings
+  prefs.begin("shaft", false);
+  pulsesPerRevolution = prefs.getInt("pulses_rev", 2);
+  pulsesPerMeter = prefs.getFloat("pulses_meter", 0.0);
+  prefs.end();
+
   MeshSerial.printf("C3 started | UID:%s | Name:%s | Group:%s\n",
                     deviceUID.c_str(), deviceName.c_str(), groupName.c_str());
 
@@ -246,14 +372,29 @@ void setup() {
   pinMode(MOTOR_AIN1, OUTPUT);
   pinMode(MOTOR_AIN2, OUTPUT);
   pinMode(PIR_PIN, INPUT);
+  pinMode(SHAFT_SENSOR_PIN, INPUT);  // Shaft rotation sensor input
   pinMode(RELAY_PIN, OUTPUT);
+  pinMode(6, INPUT_PULLUP);  // Pause/resume button
   digitalWrite(RELAY_PIN, LOW);  // Start with charging disabled
 
+<<<<<<< HEAD
   // Initialize servos first (should get LEDC channels 0,1)
   servo1.attach(SERVO1_PIN);
   servo2.attach(SERVO2_PIN);
   servo1.write(90);
   servo2.write(90);
+=======
+  // Setup interrupt for shaft sensor (TCRT5000)
+  attachInterrupt(digitalPinToInterrupt(SHAFT_SENSOR_PIN), shaftSensorISR, RISING);
+
+  // Initialize servos first (should get LEDC channels 0,1)
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(servo1Center);
+  servo2.write(servo2Center);
+  currentServo1Angle = servo1Center;
+  currentServo2Angle = servo2Center;
+>>>>>>> e68c68c72523cbbc9fe0c0d109697f5a6b915b44
 
   // Setup LEDC for LED PWM (should get channel 2)
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
@@ -262,9 +403,6 @@ void setup() {
 
   analogWrite(MOTOR_AIN1, 0);
   analogWrite(MOTOR_AIN2, 0);
-
-  setServoAngle(0, 90);
-  setServoAngle(1, 90);
 
   // Initialize INA3221
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -332,14 +470,34 @@ void setup() {
   } else {
     Serial.println("AHT30 sensor not found");
   }
+
+  // Initialize QMC5883L compass sensor
+  compass.init();
+  compassPresent = true;
+  Serial.println("QMC5883L compass initialized");
+
+  // Initial reading
+  compass.read();
+  currentHeading = compass.getAzimuth();
+  // Normalize to 0-360° range
+  if (currentHeading < 0) currentHeading += 360.0;
+  Serial.printf("Compass Initial: %.1f°\n", currentHeading);
 }
 
 void setServoAngle(int channel, int angle) {
-  Serial.println("Setting servo " + String(channel) + " to angle " + String(angle));
+  // Apply direction inversion if enabled
+  int actualAngle = angle;
+  if (channel == 0 && servo1Invert) {
+    actualAngle = servo1Center - (angle - servo1Center);
+  } else if (channel == 1 && servo2Invert) {
+    actualAngle = servo2Center - (angle - servo2Center);
+  }
+
+  Serial.println("Setting servo " + String(channel) + " to angle " + String(angle) + " (actual: " + String(actualAngle) + ")");
   if (channel == 0) {
-    servo1.write(angle);
+    servo1.write(actualAngle);
   } else if (channel == 1) {
-    servo2.write(angle);
+    servo2.write(actualAngle);
   }
 }
 
@@ -606,6 +764,30 @@ void saveLoadPowerSettings() {
   prefs.end();
 }
 
+void saveServoSettings() {
+  prefs.begin("servo", false);
+  prefs.putInt("s1min", servo1Min);
+  prefs.putInt("s1max", servo1Max);
+  prefs.putInt("s1center", servo1Center);
+  prefs.putBool("s1invert", servo1Invert);
+  prefs.putInt("s2min", servo2Min);
+  prefs.putInt("s2max", servo2Max);
+  prefs.putInt("s2center", servo2Center);
+  prefs.putBool("s2invert", servo2Invert);
+  prefs.end();
+}
+
+void saveNavSeqSettings() {
+  prefs.begin("navseq", false);
+  prefs.putUChar("mode", seqMode);
+  for (uint8_t i = 0; i < 8; i++) {
+    prefs.putShort(("seg" + String(i+1) + "_speed").c_str(), navSegments[i].speed);
+    prefs.putFloat(("seg" + String(i+1) + "_dist").c_str(), navSegments[i].dist);
+    prefs.putFloat(("seg" + String(i+1) + "_head").c_str(), navSegments[i].heading);
+  }
+  prefs.end();
+}
+
 void setupOTA() {
   ArduinoOTA.setHostname(deviceName.c_str());
   ArduinoOTA.setPassword(ota_password);
@@ -646,6 +828,7 @@ void loop() {
   static unsigned long lastINARead = 0;
   static unsigned long lastTimeRead = 0;
   static unsigned long lastAHTRead = 0;
+  static unsigned long lastCompassRead = 0;
 
   if (millis() - lastINARead >= 5000) {  // Read every 5 seconds
     readINA3221();
@@ -714,6 +897,138 @@ void loop() {
     }
 
     lastAHTRead = millis();
+  }
+
+  // Dynamic compass refresh rate based on navigation mode
+  unsigned long currentCompassInterval = navigationMode ? compassReadIntervalNav : compassReadIntervalIdle;
+  if (millis() - lastCompassRead >= currentCompassInterval && compassPresent) {
+    compass.read();
+    currentHeading = compass.getAzimuth();
+    // Normalize to 0-360° range
+    if (currentHeading < 0) currentHeading += 360.0;
+
+    if (compassCalibrating) {
+      // Collect min/max values for calibration
+      int x = compass.getX();
+      int y = compass.getY();
+      int z = compass.getZ();
+      if (x < compassCalMinX) compassCalMinX = x;
+      if (x > compassCalMaxX) compassCalMaxX = x;
+      if (y < compassCalMinY) compassCalMinY = y;
+      if (y > compassCalMaxY) compassCalMaxY = y;
+      if (z < compassCalMinZ) compassCalMinZ = z;
+      if (z > compassCalMaxZ) compassCalMaxZ = z;
+      Serial.printf("Calibrating: X:%d Y:%d Z:%d (Min:%d,%d,%d Max:%d,%d,%d)\n",
+                   x, y, z, compassCalMinX, compassCalMinY, compassCalMinZ,
+                   compassCalMaxX, compassCalMaxY, compassCalMaxZ);
+    } else {
+      Serial.printf("Compass: %.1f° X:%d Y:%d Z:%d\n", currentHeading, compass.getX(), compass.getY(), compass.getZ());
+    }
+
+    lastCompassRead = millis();
+  }
+
+  // Navigation steering control (runs every navigationUpdateInterval ms when active)
+  static unsigned long lastNavigationUpdate = 0;
+  if (millis() - lastNavigationUpdate >= navigationUpdateInterval && navigationMode) {
+    // Check compass availability
+    if (!compassPresent) {
+      // Emergency stop - compass failed during navigation
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      navigationMode = false;
+      MeshSerial.println("NAVIGATION ERROR: Compass not available - motor stopped!");
+      Serial.println("Navigation emergency stop: compass unavailable");
+    } else {
+      // Calculate shortest angular error (handles 360° wrap-around)
+      float error = targetHeading - currentHeading;
+      if (error > 180.0) error -= 360.0;
+      if (error < -180.0) error += 360.0;
+
+      // Apply deadband
+      if (abs(error) < navigationDeadband) {
+        // Within deadband - steer straight
+        setServoAngle(0, servo1Center);
+        currentServo1Angle = servo1Center;
+      } else {
+        // Outside deadband - apply proportional steering with direction correction
+        // Invert steering when motor is in reverse (front-wheel steering vehicle)
+        int steeringDirection = (currentMotorSpeed >= 0) ? 1 : -1;
+        int steeringAngle = servo1Center + (error * navigationSteeringGain * steeringDirection);
+        // Clamp to servo limits
+        steeringAngle = constrain(steeringAngle, servo1Min, servo1Max);
+        setServoAngle(0, steeringAngle);
+        currentServo1Angle = steeringAngle;
+      }
+    }
+
+    lastNavigationUpdate = millis();
+  }
+
+  // Navigation sequence logic
+  if (navSequenceActive && !navSequencePaused) {
+    // Set motor speed for current segment
+    int speed = navSegments[navCurrentSegment].speed;
+    if (speed > 0) {
+      analogWrite(MOTOR_AIN1, speed);
+      analogWrite(MOTOR_AIN2, 0);
+    } else if (speed < 0) {
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, -speed);
+    } else {
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+    }
+    currentMotorSpeed = speed;
+
+    // Set target heading
+    targetHeading = navSegments[navCurrentSegment].heading;
+    navigationMode = true;  // Enable navigation for heading hold
+
+    // Check distance
+    if (pulsesPerMeter > 0.0) {
+      float traveled = currentDistance - navSegStartDist;
+      if (traveled >= navSegments[navCurrentSegment].dist) {
+        navCurrentSegment++;
+        if (navCurrentSegment >= 8 || navSegments[navCurrentSegment].dist == 0.0) {
+          // End of sequence
+          if (seqMode == NAV_LOOP) {
+            navCurrentSegment = 0;
+            navSegStartDist = currentDistance;
+            MeshSerial.println("navseq: looped back to segment 1");
+          } else {
+            navSequenceActive = false;
+            navigationMode = false;
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, 0);
+            currentMotorSpeed = 0;
+            setServoAngle(0, servo1Center);
+            currentServo1Angle = servo1Center;
+            MeshSerial.println("navseq: sequence complete");
+          }
+        } else {
+          // Next segment
+          navSegStartDist = currentDistance;
+          MeshSerial.printf("navseq: advanced to segment %d\n", navCurrentSegment + 1);
+        }
+      }
+    }
+  } else if (navSequenceActive && navSequencePaused) {
+    // Paused: stop motor, center servo
+    analogWrite(MOTOR_AIN1, 0);
+    analogWrite(MOTOR_AIN2, 0);
+    currentMotorSpeed = 0;
+    setServoAngle(0, servo1Center);
+    currentServo1Angle = servo1Center;
+  }
+
+  // Button for pause/resume
+  static unsigned long lastBtnPress = 0;
+  if (digitalRead(6) == LOW && millis() - lastBtnPress > 500) {
+    navSequencePaused = !navSequencePaused;
+    lastBtnPress = millis();
+    MeshSerial.printf("navseq: %s (button)\n", navSequencePaused ? "paused" : "resumed");
   }
 
   if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
@@ -873,6 +1188,52 @@ void loop() {
     currentLedPwm = 0;
   }
 
+
+
+  // Shaft sensor RPM calculation and motion detection
+  if (millis() - lastRPMCalculation >= RPM_CALCULATION_INTERVAL) {
+    // Calculate RPM: pulses per second * 60 / pulses per revolution
+    // We have 1 pulse per revolution, so RPM = (pulses in last second) * 60
+    noInterrupts();
+    unsigned long pulseCount = shaftPulseCount;
+    shaftPulseCount = 0;  // Reset counter
+    interrupts();
+
+    // Calculate RPM: pulses per second * 60 / pulses per revolution
+    currentRPM = (pulseCount * 60.0) / (RPM_CALCULATION_INTERVAL / 1000.0) / pulsesPerRevolution;
+
+    // Calculate distance if calibrated: distance = total_pulses / pulses_per_meter
+    if (pulsesPerMeter > 0.0) {
+      noInterrupts();
+      unsigned long totalPulses = totalDistancePulses;
+      interrupts();
+      currentDistance = totalPulses / pulsesPerMeter;
+    }
+
+    // Motion detection: vehicle is moving if we got pulses recently
+    vehicleMoving = (millis() - lastShaftPulseTime) < MOTION_TIMEOUT;
+
+    Serial.printf("Shaft: %.1f RPM, %.2fm, %s\n", currentRPM, currentDistance, vehicleMoving ? "MOVING" : "STOPPED");
+
+    lastRPMCalculation = millis();
+  }
+
+  // Distance-based motor control monitoring
+  if (distanceMotorActive && pulsesPerMeter > 0.0) {
+    float distanceTraveled = currentDistance - distanceMotorStart;
+    if (distanceTraveled >= distanceMotorTarget) {
+      // Target distance reached - stop motor
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      distanceMotorActive = false;
+
+      MeshSerial.printf("motor stopped: %.1fm reached (target: %.1fm)\n",
+                       distanceTraveled, distanceMotorTarget);
+      Serial.printf("Distance motor stopped: %.1fm reached\n", distanceTraveled);
+    }
+  }
+
   // WiFi reconnection logic (only if WiFi is enabled)
   if (wifiEnabled && WiFi.status() != WL_CONNECTED && millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
     MeshSerial.println("WiFi disconnected, attempting reconnection...");
@@ -911,19 +1272,133 @@ void loop() {
     cmd.trim();
 
     if (cmd.startsWith("servo1:")) {
-      int angle = cmd.substring(7).toInt();
-      if (angle >= 0 && angle <= 180) {
-        setServoAngle(0, angle);
-        currentServo1Angle = angle;
-        MeshSerial.printf("servo1 → %d\n", angle);
+      String subCmd = cmd.substring(7);
+      if (subCmd.startsWith("min:")) {
+        int newMin = subCmd.substring(4).toInt();
+        if (newMin >= 0 && newMin <= 180 && newMin < servo1Max) {
+          servo1Min = newMin;
+          if (servo1Center < servo1Min) servo1Center = servo1Min;
+          saveServoSettings();
+          MeshSerial.printf("servo1 min → %d\n", servo1Min);
+        } else {
+          MeshSerial.println("Invalid servo1 min (0-180, < max)");
+        }
+      } else if (subCmd.startsWith("max:")) {
+        int newMax = subCmd.substring(4).toInt();
+        if (newMax >= 0 && newMax <= 180 && newMax > servo1Min) {
+          servo1Max = newMax;
+          if (servo1Center > servo1Max) servo1Center = servo1Max;
+          saveServoSettings();
+          MeshSerial.printf("servo1 max → %d\n", servo1Max);
+        } else {
+          MeshSerial.println("Invalid servo1 max (0-180, > min)");
+        }
+      } else if (subCmd.startsWith("center:")) {
+        int newCenter = subCmd.substring(7).toInt();
+        if (newCenter >= servo1Min && newCenter <= servo1Max) {
+          servo1Center = newCenter;
+          saveServoSettings();
+          MeshSerial.printf("servo1 center → %d\n", servo1Center);
+        } else {
+          MeshSerial.printf("Invalid servo1 center (%d-%d)\n", servo1Min, servo1Max);
+        }
+      } else if (subCmd.startsWith("invert:")) {
+        String state = subCmd.substring(7);
+        state.toLowerCase();
+        if (state == "on" || state == "1") {
+          servo1Invert = true;
+          saveServoSettings();
+          MeshSerial.println("servo1 invert → on");
+        } else if (state == "off" || state == "0") {
+          servo1Invert = false;
+          saveServoSettings();
+          MeshSerial.println("servo1 invert → off");
+        } else {
+          MeshSerial.println("Use 'on' or 'off'");
+        }
+      } else if (subCmd == "invert") {
+        MeshSerial.printf("servo1 invert: %s\n", servo1Invert ? "on" : "off");
+      } else if (subCmd == "center") {
+        // Return servo to center position
+        setServoAngle(0, servo1Center);
+        currentServo1Angle = servo1Center;
+        MeshSerial.printf("servo1 → center (%d)\n", servo1Center);
+      } else {
+        // Direct angle control with clamping
+        int angle = subCmd.toInt();
+        int clampedAngle = constrain(angle, servo1Min, servo1Max);
+        setServoAngle(0, clampedAngle);
+        currentServo1Angle = clampedAngle;
+        if (clampedAngle != angle) {
+          MeshSerial.printf("servo1 → %d*\n", clampedAngle);
+        } else {
+          MeshSerial.printf("servo1 → %d\n", clampedAngle);
+        }
       }
     }
     else if (cmd.startsWith("servo2:")) {
-      int angle = cmd.substring(7).toInt();
-      if (angle >= 0 && angle <= 180) {
-        setServoAngle(1, angle);
-        currentServo2Angle = angle;
-        MeshSerial.printf("servo2 → %d\n", angle);
+      String subCmd = cmd.substring(7);
+      if (subCmd.startsWith("min:")) {
+        int newMin = subCmd.substring(4).toInt();
+        if (newMin >= 0 && newMin <= 180 && newMin < servo2Max) {
+          servo2Min = newMin;
+          if (servo2Center < servo2Min) servo2Center = servo2Min;
+          saveServoSettings();
+          MeshSerial.printf("servo2 min → %d\n", servo2Min);
+        } else {
+          MeshSerial.println("Invalid servo2 min (0-180, < max)");
+        }
+      } else if (subCmd.startsWith("max:")) {
+        int newMax = subCmd.substring(4).toInt();
+        if (newMax >= 0 && newMax <= 180 && newMax > servo2Min) {
+          servo2Max = newMax;
+          if (servo2Center > servo2Max) servo2Center = servo2Max;
+          saveServoSettings();
+          MeshSerial.printf("servo2 max → %d\n", servo2Max);
+        } else {
+          MeshSerial.println("Invalid servo2 max (0-180, > min)");
+        }
+      } else if (subCmd.startsWith("center:")) {
+        int newCenter = subCmd.substring(7).toInt();
+        if (newCenter >= servo2Min && newCenter <= servo2Max) {
+          servo2Center = newCenter;
+          saveServoSettings();
+          MeshSerial.printf("servo2 center → %d\n", servo2Center);
+        } else {
+          MeshSerial.printf("Invalid servo2 center (%d-%d)\n", servo2Min, servo2Max);
+        }
+      } else if (subCmd.startsWith("invert:")) {
+        String state = subCmd.substring(7);
+        state.toLowerCase();
+        if (state == "on" || state == "1") {
+          servo2Invert = true;
+          saveServoSettings();
+          MeshSerial.println("servo2 invert → on");
+        } else if (state == "off" || state == "0") {
+          servo2Invert = false;
+          saveServoSettings();
+          MeshSerial.println("servo2 invert → off");
+        } else {
+          MeshSerial.println("Use 'on' or 'off'");
+        }
+      } else if (subCmd == "invert") {
+        MeshSerial.printf("servo2 invert: %s\n", servo2Invert ? "on" : "off");
+      } else if (subCmd == "center") {
+        // Return servo to center position
+        setServoAngle(1, servo2Center);
+        currentServo2Angle = servo2Center;
+        MeshSerial.printf("servo2 → center (%d)\n", servo2Center);
+      } else {
+        // Direct angle control with clamping
+        int angle = subCmd.toInt();
+        int clampedAngle = constrain(angle, servo2Min, servo2Max);
+        setServoAngle(1, clampedAngle);
+        currentServo2Angle = clampedAngle;
+        if (clampedAngle != angle) {
+          MeshSerial.printf("servo2 → %d*\n", clampedAngle);
+        } else {
+          MeshSerial.printf("servo2 → %d\n", clampedAngle);
+        }
       }
     }
     else if (cmd.startsWith("light:")) {
@@ -938,20 +1413,68 @@ void loop() {
       }
     }
     else if (cmd.startsWith("motor:")) {
-      int speed = cmd.substring(6).toInt();
-      if (speed >= -255 && speed <= 255) {
-        if (speed > 0) {
-          analogWrite(MOTOR_AIN1, speed);
-          analogWrite(MOTOR_AIN2, 0);
-        } else if (speed < 0) {
-          analogWrite(MOTOR_AIN1, 0);
-          analogWrite(MOTOR_AIN2, -speed);
-        } else {
-          analogWrite(MOTOR_AIN1, 0);
-          analogWrite(MOTOR_AIN2, 0);
+      String motorParam = cmd.substring(6);
+      int dashIndex = motorParam.indexOf('-');
+
+      if (dashIndex > 0) {
+        // Distance-based command: motor:speed-distance
+        String speedStr = motorParam.substring(0, dashIndex);
+        String distanceStr = motorParam.substring(dashIndex + 1);
+
+        int speed = speedStr.toInt();
+        float distance = 0.0;
+
+        // Parse distance (must end with 'm' for meters)
+        if (distanceStr.endsWith("m")) {
+          distanceStr = distanceStr.substring(0, distanceStr.length() - 1);
+          distance = distanceStr.toFloat();
         }
-        currentMotorSpeed = speed;
-        MeshSerial.printf("motor → %d\n", speed);
+
+        // Validate parameters
+        if (speed >= -255 && speed <= 255 && distance > 0.0 && distance <= 1000.0 && pulsesPerMeter > 0.0) {
+          // Cancel any existing distance motor command
+          distanceMotorActive = false;
+
+          // Set up new distance command
+          distanceMotorSpeed = speed;
+          distanceMotorTarget = distance;
+          distanceMotorStart = currentDistance;
+          distanceMotorActive = true;
+
+          // Start motor
+          if (speed > 0) {
+            analogWrite(MOTOR_AIN1, speed);
+            analogWrite(MOTOR_AIN2, 0);
+          } else if (speed < 0) {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, -speed);
+          }
+          currentMotorSpeed = speed;
+
+          MeshSerial.printf("motor → %d for %.1fm (target: %.1fm)\n", speed, distance, distanceMotorStart + distance);
+        } else {
+          MeshSerial.println("Invalid distance command (speed -255-255, distance 0.1-1000.0m, must be calibrated)");
+        }
+      } else {
+        // Standard speed command: motor:speed
+        int speed = motorParam.toInt();
+        if (speed >= -255 && speed <= 255) {
+          // Cancel any distance motor command
+          distanceMotorActive = false;
+
+          if (speed > 0) {
+            analogWrite(MOTOR_AIN1, speed);
+            analogWrite(MOTOR_AIN2, 0);
+          } else if (speed < 0) {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, -speed);
+          } else {
+            analogWrite(MOTOR_AIN1, 0);
+            analogWrite(MOTOR_AIN2, 0);
+          }
+          currentMotorSpeed = speed;
+          MeshSerial.printf("motor → %d\n", speed);
+        }
       }
     }
     else if (cmd.startsWith("wifi:")) {
@@ -1069,15 +1592,18 @@ void loop() {
       MeshSerial.printf("battery: %.2fV %.1fmA %.3fW\n", inaBusV[1], inaCurrent[1]*1000, inaPower[1]);
       MeshSerial.printf("led_load: %.2fV %.1fmA %.3fW\n", inaBusV[2], inaCurrent[2]*1000, inaPower[2]);
     }
-    // statusM: motor status (name, motor, servo1, servo2, light)
+    // statusM: motor status (name, motor, servo1, servo2, light, rpm, motion)
     else if (cmd == "statusM") {
       MeshSerial.printf("name: %s\n", deviceName.c_str());
       MeshSerial.printf("motor: %d\n", currentMotorSpeed);
-      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
-      MeshSerial.printf("servo2: %d\n", currentServo2Angle);
+      MeshSerial.printf("servo1: %d (%d-%d, center:%d, invert:%s)\n", currentServo1Angle, servo1Min, servo1Max, servo1Center, servo1Invert ? "on" : "off");
+      MeshSerial.printf("servo2: %d (%d-%d, center:%d, invert:%s)\n", currentServo2Angle, servo2Min, servo2Max, servo2Center, servo2Invert ? "on" : "off");
 
       String lightState = currentLedPwm == 255 ? "on" : currentLedPwm > 0 ? "dim" : "off";
       MeshSerial.printf("light: %s (%d)\n", lightState.c_str(), currentLedPwm);
+
+      MeshSerial.printf("rpm: %.1f\n", currentRPM);
+      MeshSerial.printf("motion: %s\n", vehicleMoving ? "MOVING" : "STOPPED");
     }
     // ina: detailed power readings
     else if (cmd == "ina") {
@@ -1489,6 +2015,324 @@ void loop() {
       String chemName = (batteryChemistry == BAT_LI_ION) ? "Li-ion" : "Lead-acid";
       MeshSerial.printf("chemistry:%s temp:%.1f-%.1f°C\n",
                        chemName.c_str(), chargeTempMin, chargeTempMax);
+    }
+    // compass - Get current compass heading and refresh mode
+    else if (cmd == "compass") {
+      if (compassPresent) {
+        String modeStr = navigationMode ? "nav" : "idle";
+        unsigned long currentInterval = navigationMode ? compassReadIntervalNav : compassReadIntervalIdle;
+        MeshSerial.printf("compass: %.1f° (%s mode, %lu ms interval)\n",
+                         currentHeading, modeStr.c_str(), currentInterval);
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:raw - Get raw X,Y,Z magnetic field values
+    else if (cmd == "compass:raw") {
+      if (compassPresent) {
+        compass.read();
+        MeshSerial.printf("compass raw: X:%d Y:%d Z:%d\n", compass.getX(), compass.getY(), compass.getZ());
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:calibrate - Start compass calibration process
+    else if (cmd == "compass:calibrate") {
+      if (compassPresent) {
+        compassCalibrating = true;
+        compassCalMinX = 32767; compassCalMaxX = -32768;
+        compassCalMinY = 32767; compassCalMaxY = -32768;
+        compassCalMinZ = 32767; compassCalMaxZ = -32768;
+        MeshSerial.println("Compass calibration started:");
+        MeshSerial.println("1. Rotate device 360° slowly in all axes");
+        MeshSerial.println("2. Send 'compass:calibrate:done' when finished");
+        MeshSerial.println("3. Calibration data will be collected and applied");
+      } else {
+        MeshSerial.println("compass: not available");
+      }
+    }
+    // compass:calibrate:done - Finish calibration and apply offsets
+    else if (cmd == "compass:calibrate:done") {
+      if (compassPresent && compassCalibrating) {
+        compassCalibrating = false;
+        // Calculate offsets (center of range)
+        int offsetX = (compassCalMaxX + compassCalMinX) / 2;
+        int offsetY = (compassCalMaxY + compassCalMinY) / 2;
+        int offsetZ = (compassCalMaxZ + compassCalMinZ) / 2;
+        // Calculate scales (assuming spherical calibration)
+        int rangeX = compassCalMaxX - compassCalMinX;
+        int rangeY = compassCalMaxY - compassCalMinY;
+        int rangeZ = compassCalMaxZ - compassCalMinZ;
+        float scaleX = 1000.0 / rangeX;
+        float scaleY = 1000.0 / rangeY;
+        float scaleZ = 1000.0 / rangeZ;
+
+        compass.setCalibrationOffsets(offsetX, offsetY, offsetZ);
+        compass.setCalibrationScales(scaleX, scaleY, scaleZ);
+
+        MeshSerial.printf("Calibration applied:\n");
+        MeshSerial.printf("Offsets: X:%d Y:%d Z:%d\n", offsetX, offsetY, offsetZ);
+        MeshSerial.printf("Scales: X:%.2f Y:%.2f Z:%.2f\n", scaleX, scaleY, scaleZ);
+        MeshSerial.printf("Ranges: X:%d Y:%d Z:%d\n", rangeX, rangeY, rangeZ);
+      } else {
+        MeshSerial.println("Calibration not in progress or compass not available");
+      }
+    }
+    // compass:interval:nav:XXX - Set navigation mode refresh interval (100-2000ms)
+    else if (cmd.startsWith("compass:interval:nav:")) {
+      unsigned long interval = cmd.substring(21).toInt();
+      if (interval >= 100 && interval <= 2000) {
+        compassReadIntervalNav = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("compass_nav", compassReadIntervalNav);
+        prefs.end();
+        MeshSerial.printf("Compass nav interval → %lu ms\n", compassReadIntervalNav);
+      } else {
+        MeshSerial.println("Invalid nav interval (100-2000 ms)");
+      }
+    }
+    // compass:interval:idle:XXX - Set idle mode refresh interval (1000-10000ms)
+    else if (cmd.startsWith("compass:interval:idle:")) {
+      unsigned long interval = cmd.substring(22).toInt();
+      if (interval >= 1000 && interval <= 10000) {
+        compassReadIntervalIdle = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("compass_idle", compassReadIntervalIdle);
+        prefs.end();
+        MeshSerial.printf("Compass idle interval → %lu ms\n", compassReadIntervalIdle);
+      } else {
+        MeshSerial.println("Invalid idle interval (1000-10000 ms)");
+      }
+    }
+    // compass:interval - Show current compass refresh intervals
+    else if (cmd == "compass:interval") {
+      MeshSerial.printf("compass intervals: nav=%lu ms, idle=%lu ms\n",
+                       compassReadIntervalNav, compassReadIntervalIdle);
+    }
+    // shaft:pulses:X - Set pulses per revolution for RPM calculation (1-10)
+    else if (cmd.startsWith("shaft:pulses:")) {
+      int pulses = cmd.substring(13).toInt();
+      if (pulses >= 1 && pulses <= 10) {
+        pulsesPerRevolution = pulses;
+        prefs.begin("shaft", false);
+        prefs.putInt("pulses_rev", pulsesPerRevolution);
+        prefs.end();
+        MeshSerial.printf("Shaft pulses per revolution → %d\n", pulsesPerRevolution);
+      } else {
+        MeshSerial.println("Invalid pulses per revolution (1-10)");
+      }
+    }
+    // distance - Get current distance traveled
+    else if (cmd == "distance") {
+      if (pulsesPerMeter > 0.0) {
+        MeshSerial.printf("distance: %.2f meters\n", currentDistance);
+      } else {
+        MeshSerial.println("distance: not calibrated");
+      }
+    }
+    // distance:reset - Reset distance counter to zero
+    else if (cmd == "distance:reset") {
+      noInterrupts();
+      totalDistancePulses = 0;
+      interrupts();
+      currentDistance = 0.0;
+      MeshSerial.println("distance counter → reset");
+    }
+    // distance:pulses:X.X - Set pulses per meter directly (0.1-1000.0)
+    else if (cmd.startsWith("distance:pulses:")) {
+      float pulses = cmd.substring(16).toFloat();
+      if (pulses >= 0.1 && pulses <= 1000.0) {
+        pulsesPerMeter = pulses;
+        prefs.begin("shaft", false);
+        prefs.putFloat("pulses_meter", pulsesPerMeter);
+        prefs.end();
+        MeshSerial.printf("pulses per meter → %.1f\n", pulsesPerMeter);
+      } else {
+        MeshSerial.println("Invalid pulses per meter (0.1-1000.0)");
+      }
+    }
+
+    // navigation:on - Enable navigation mode
+    else if (cmd == "navigation:on") {
+      if (compassPresent) {
+        navigationMode = true;
+        MeshSerial.println("Navigation mode → on");
+      } else {
+        MeshSerial.println("Navigation: compass not available");
+      }
+    }
+    // navigation:off - Disable navigation mode
+    else if (cmd == "navigation:off") {
+      navigationMode = false;
+      // Return servo to center when disabling navigation
+      setServoAngle(0, servo1Center);
+      currentServo1Angle = servo1Center;
+      MeshSerial.println("Navigation mode → off");
+    }
+    // navigation:heading:XXX - Set target heading (0-360°)
+    else if (cmd.startsWith("navigation:heading:")) {
+      float heading = cmd.substring(19).toFloat();
+      if (heading >= 0.0 && heading <= 360.0) {
+        targetHeading = heading;
+        MeshSerial.printf("Navigation heading → %.1f°\n", targetHeading);
+      } else {
+        MeshSerial.println("Invalid heading (0-360°)");
+      }
+    }
+    // statusN - Get navigation status and settings
+    else if (cmd == "statusN") {
+      MeshSerial.printf("navigation: %s\n", navigationMode ? "ON" : "OFF");
+      MeshSerial.printf("target: %.1f°\n", targetHeading);
+      MeshSerial.printf("current: %.1f°\n", currentHeading);
+      MeshSerial.printf("motor: %d (%s)\n", currentMotorSpeed,
+                       currentMotorSpeed >= 0 ? "forward" : "reverse");
+      MeshSerial.printf("servo1: %d\n", currentServo1Angle);
+      MeshSerial.printf("gain: %d\n", navigationSteeringGain);
+      MeshSerial.printf("deadband: %.1f°\n", navigationDeadband);
+      MeshSerial.printf("interval: %lu ms\n", navigationUpdateInterval);
+    }
+    // navigation:gain:X - Set steering gain (1-10)
+    else if (cmd.startsWith("navigation:gain:")) {
+      int gain = cmd.substring(16).toInt();
+      if (gain >= 1 && gain <= 10) {
+        navigationSteeringGain = gain;
+        prefs.begin("navigation", false);
+        prefs.putInt("gain", navigationSteeringGain);
+        prefs.end();
+        MeshSerial.printf("Navigation gain → %d\n", navigationSteeringGain);
+      } else {
+        MeshSerial.println("Invalid gain (1-10)");
+      }
+    }
+    // navigation:deadband:X.X - Set deadband (0-10°)
+    else if (cmd.startsWith("navigation:deadband:")) {
+      float deadband = cmd.substring(20).toFloat();
+      if (deadband >= 0.0 && deadband <= 10.0) {
+        navigationDeadband = deadband;
+        prefs.begin("navigation", false);
+        prefs.putFloat("deadband", navigationDeadband);
+        prefs.end();
+        MeshSerial.printf("Navigation deadband → %.1f°\n", navigationDeadband);
+      } else {
+        MeshSerial.println("Invalid deadband (0-10°)");
+      }
+    }
+    // navigation:interval:XX - Set update interval in milliseconds (10-200)
+    else if (cmd.startsWith("navigation:interval:")) {
+      unsigned long interval = cmd.substring(20).toInt();
+      if (interval >= 10 && interval <= 200) {
+        navigationUpdateInterval = interval;
+        prefs.begin("navigation", false);
+        prefs.putULong("interval", navigationUpdateInterval);
+        prefs.end();
+        MeshSerial.printf("Navigation interval → %lu ms\n", navigationUpdateInterval);
+      } else {
+        MeshSerial.println("Invalid interval (10-200 ms)");
+      }
+    }
+    // navsegN:speed-dist-head - Set navigation segment N (1-8)
+    else if (cmd.startsWith("navseg")) {
+      int segNum = cmd.substring(6,7).toInt() - 1;
+      if (segNum >= 0 && segNum < 8) {
+        String params = cmd.substring(8);
+        int dash1 = params.indexOf('-');
+        int dash2 = params.indexOf('-', dash1+1);
+        if (dash1 > 0 && dash2 > dash1) {
+          int speed = params.substring(0, dash1).toInt();
+          float dist = params.substring(dash1+1, dash2).toFloat();
+          float head = params.substring(dash2+1).toFloat();
+          if (speed >= -255 && speed <= 255 && dist > 0.0 && dist <= 1000.0 && head >= 0.0 && head <= 360.0) {
+            navSegments[segNum].speed = speed;
+            navSegments[segNum].dist = dist;
+            navSegments[segNum].heading = head;
+            saveNavSeqSettings();
+            MeshSerial.printf("navseg%d → speed:%d dist:%.1fm head:%.1f°\n", segNum+1, speed, dist, head);
+          } else {
+            MeshSerial.println("Invalid navseg params");
+          }
+        } else {
+          MeshSerial.println("Invalid navseg format (navsegN:speed-dist-head)");
+        }
+      } else {
+        MeshSerial.println("Invalid segment number (1-8)");
+      }
+    }
+    // navseq:start - Start navigation sequence
+    else if (cmd == "navseq:start") {
+      if (compassPresent && pulsesPerMeter > 0.0) {
+        navSequenceActive = true;
+        navSequencePaused = false;
+        navCurrentSegment = 0;
+        navSegStartDist = currentDistance;
+        navigationMode = true;
+        MeshSerial.println("navseq: started");
+      } else {
+        MeshSerial.println("navseq: compass or distance not calibrated");
+      }
+    }
+    // navseq:stop - Stop navigation sequence
+    else if (cmd == "navseq:stop") {
+      navSequenceActive = false;
+      navSequencePaused = false;
+      navigationMode = false;
+      analogWrite(MOTOR_AIN1, 0);
+      analogWrite(MOTOR_AIN2, 0);
+      currentMotorSpeed = 0;
+      setServoAngle(0, servo1Center);
+      currentServo1Angle = servo1Center;
+      MeshSerial.println("navseq: stopped");
+    }
+    // navseq:pause - Pause navigation sequence
+    else if (cmd == "navseq:pause") {
+      if (navSequenceActive) {
+        navSequencePaused = true;
+        MeshSerial.println("navseq: paused");
+      }
+    }
+    // navseq:resume - Resume navigation sequence
+    else if (cmd == "navseq:resume") {
+      if (navSequenceActive) {
+        navSequencePaused = false;
+        MeshSerial.println("navseq: resumed");
+      }
+    }
+    // navseq:mode:stop|loop|run - Set end-of-sequence mode
+    else if (cmd.startsWith("navseq:mode:")) {
+      String modeStr = cmd.substring(12);
+      if (modeStr == "stop") seqMode = NAV_STOP;
+      else if (modeStr == "loop") seqMode = NAV_LOOP;
+      else if (modeStr == "run") seqMode = NAV_SINGLE_RUN;
+      else {
+        MeshSerial.println("Invalid mode (stop/loop/run)");
+        return;
+      }
+      saveNavSeqSettings();
+      MeshSerial.printf("navseq mode → %s\n", modeStr.c_str());
+    }
+    // navseq:clear - Clear all navigation segments
+    else if (cmd == "navseq:clear") {
+      for (uint8_t i = 0; i < 8; i++) {
+        navSegments[i] = {0, 0.0, 0.0};
+      }
+      saveNavSeqSettings();
+      MeshSerial.println("navseq: cleared");
+    }
+    // statusNS - Navigation sequence status
+    else if (cmd == "statusNS") {
+      MeshSerial.printf("navseq: %s\n", navSequenceActive ? "ON" : "OFF");
+      if (navSequenceActive) {
+        MeshSerial.printf("paused: %s\n", navSequencePaused ? "YES" : "NO");
+        MeshSerial.printf("segment: %d/8\n", navCurrentSegment + 1);
+        MeshSerial.printf("mode: %s\n", seqMode == NAV_STOP ? "STOP" : seqMode == NAV_LOOP ? "LOOP" : "RUN");
+        if (pulsesPerMeter > 0.0) {
+          float traveled = currentDistance - navSegStartDist;
+          float rem = navSegments[navCurrentSegment].dist - traveled;
+          MeshSerial.printf("remaining: %.2fm\n", rem > 0 ? rem : 0);
+        }
+        MeshSerial.printf("target head: %.1f°\n", navSegments[navCurrentSegment].heading);
+        MeshSerial.printf("current head: %.1f°\n", currentHeading);
+        MeshSerial.printf("motor: %d\n", navSegments[navCurrentSegment].speed);
+      }
     }
   }
 }
